@@ -4,6 +4,12 @@
 
 **当前版本：20261106.38，诊断版，待实机验收。** 已知长行程停滞、过冲、启停位置变化仍待解决。离线测试通过不代表这些实机问题已经修复；详见 [已知问题](docs/KNOWN_ISSUES.md)。
 
+## 最新版界面
+
+![Xeryon Control 20261106.38：紧凑双栏控制台，顶部导航、状态和 STOP 同排](docs/images/xeryon-control-20261106-38.jpg)
+
+20261106.38 实际程序截图（未连接设备）。[下载 Windows 诊断版](https://github.com/Baoqi-pku2/xeryon-control/releases/tag/v20261106.38)。
+
 ## 运行
 
 Windows 建议使用 Python 3.13（含 Tcl/Tk）。首次运行双击 `run_gui.cmd`，脚本会创建本地环境、安装依赖并打开界面；打开界面不会自动连接设备。
