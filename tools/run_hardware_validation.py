@@ -56,7 +56,6 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
     app.reset_on_connect_var.set(False)
     app.node_b_enabled_var.set(False)
     app.encoder_var.set("1MU")
-    app.encoder_verified_var.set(True)
     app.shortcut_dwell_var.set("30")
     app.acceleration_var.set(str(acceleration))
     app.max_velocity_var.set(str(max(float(app.max_velocity_var.get()), speed)))
@@ -72,7 +71,7 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
         original_record(event, **values)
         if event == 'stop_verified':
             verified_stops[values['node_id']] = dict(values)
-        if event in ('stop_verified', 'position_reference_changed', 'command', 'terminal_live'):
+        if event in ('stop_verified', 'position_reference_changed', 'unexpected_displacement', 'command', 'terminal_live'):
             with output.with_suffix('.events.jsonl').open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps(dict(event=event,monotonic_s=time.monotonic(),**values),ensure_ascii=False)+'\n')
     app._record_motion_event = record

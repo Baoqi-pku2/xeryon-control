@@ -35,6 +35,8 @@ class PositionPanel(ttk.Frame):
         # Both tabs edit the same intended target; drawing never commands motion.
         self.target = app.target_position_var
         self.user_zero_um = 0.0
+        self.axis_zeros = {}
+        self.restoring_axis = False
         self.user_zero_set = False
         self.user_target = tk.StringVar(value=self.target.get())
         self._syncing_target = False
@@ -49,6 +51,8 @@ class PositionPanel(ttk.Frame):
         self.end_distance_text = tk.StringVar()
         self.actual_text = tk.StringVar(value="— µm")
         self.feedback_text = tk.StringVar(value="未连接 · 等待编码器反馈")
+        self.encoder_caption = tk.StringVar()
+        self.position_count = None
         self.delta_text = tk.StringVar(value="—")
         self.readiness_text = tk.StringVar()
         self.calibration_badge_text = tk.StringVar(value="零点未标定")
@@ -72,7 +76,8 @@ class PositionPanel(ttk.Frame):
         ttk.Button(port_row, text="连接设备", style="Accent.TButton", command=self.connect).pack(side="left")
         zero_row = ttk.Frame(connection)
         zero_row.grid(row=0, column=1, sticky="e", padx=(12, 0))
-        self.zero_button = ttk.Button(zero_row, text="收回端点置零", style="Setup.TButton", command=app.set_current_user_zero)
+        ttk.Label(zero_row, text="置零会短暂使能，请先松手", style="Muted.TLabel").pack(side="left", padx=(0, 8))
+        self.zero_button = ttk.Button(zero_row, text="收回端点置零", style="Setup.TButton", command=lambda: app.review_reference() if app.reference_review is not None else app.set_current_user_zero())
         self.zero_button.pack(side="left", padx=(0, 10))
         self.calibration_badge = ttk.Label(zero_row, textvariable=self.calibration_badge_text, style="BadgeWarn.TLabel")
         self.calibration_badge.pack(side="left")
@@ -105,11 +110,13 @@ class PositionPanel(ttk.Frame):
         telemetry.columnconfigure(0, weight=1)
         tk.Label(telemetry, textvariable=self.feedback_text, background="#EFEDF1", foreground="#22252D",
                  font=(FONT_UI, 9, "bold"), height=1, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(telemetry, textvariable=self.encoder_caption, background="#EFEDF1", foreground="#64748b",
+                 font=(FONT_UI, 9), anchor="e").grid(row=0, column=1, sticky="e", padx=(4, 0))
         tk.Label(telemetry, textvariable=self.travel_text, background="#EFEDF1", foreground="#626B7B",
                  font=(FONT_UI, 9), wraplength=480, anchor="nw", justify="left").grid(
-                     row=1, column=0, sticky="w", pady=(2, 0))
+                     row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
         tk.Label(telemetry, textvariable=self.end_distance_text, background="#EFEDF1", foreground="#626B7B",
-                 font=(FONT_UI, 9), height=1, anchor="w").grid(row=2, column=0, sticky="w", pady=(2, 0))
+                 font=(FONT_UI, 9), height=1, anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         self.control_card = RoundedCard(self, "目标与运动")
         self.control_card.grid(row=1, column=1, sticky="nsew")
@@ -124,7 +131,7 @@ class PositionPanel(ttk.Frame):
         readout_card = tk.Frame(controls, background="#EFEDF1", highlightbackground="#E6E4ED", highlightthickness=0, padx=12, pady=4)
         readout_card.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         readout_card.columnconfigure(0, weight=1)
-        self.actual_caption = tk.StringVar(value="当前位置 · 编码器 µm")
+        self.actual_caption = tk.StringVar()
         ttk.Label(readout_card, textvariable=self.actual_caption, style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
         value_row = tk.Frame(readout_card, background="#EFEDF1")
         value_row.grid(row=0, column=1, sticky="e")
@@ -132,7 +139,7 @@ class PositionPanel(ttk.Frame):
             value_row,
             textvariable=self.actual_text,
             font=(FONT_NUM, 22, "bold"),
-            width=9,
+            width=10,
             anchor="w",
             foreground="#155DCC",
             background="#EFEDF1",
@@ -150,7 +157,8 @@ class PositionPanel(ttk.Frame):
         target_header = ttk.Frame(controls)
         target_header.grid(row=1, column=0, sticky="ew")
         target_header.columnconfigure(0, weight=1)
-        ttk.Label(target_header, text="目标位置（µm）", foreground="#155DCC", font=(FONT_UI, 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.target_caption = tk.StringVar()
+        ttk.Label(target_header, textvariable=self.target_caption, foreground="#155DCC", font=(FONT_UI, 10, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(target_header, textvariable=self.delta_text, style="StepBadge.TLabel", anchor="center").grid(row=0, column=1, sticky="e")
 
         self.entry = ttk.Entry(controls, textvariable=self.user_target, font=(FONT_NUM, 14, "bold"))
@@ -188,9 +196,6 @@ class PositionPanel(ttk.Frame):
         encoder.grid(row=7, column=0, sticky="ew", pady=(0, 4))
         ttk.Label(encoder, text="编码器分辨率：", style="CardMuted.TLabel").pack(side="left")
         ttk.Label(encoder, textvariable=app.encoder_var, style="StepBadge.TLabel").pack(side="left", padx=(2, 12))
-        self.encoder_check = ttk.Checkbutton(encoder, text="已核对实物标签",
-                                             variable=app.encoder_verified_var, command=self.redraw)
-        self.encoder_check.pack(side="left")
 
         self.readiness_label = ttk.Label(controls, textvariable=self.readiness_text, wraplength=440,
                                          style="Status.TLabel", anchor="center")
@@ -228,6 +233,8 @@ class PositionPanel(ttk.Frame):
                 text=f"{number}  {name}\n{target:g} µm · {speed:g} µm/s",
                 style="Shortcut.TButton", command=lambda value=number: app.toggle_shortcut(value))
             self.shortcut_buttons[number] = button
+        app.workflow_start_var.trace_add("write", lambda *_: self.shortcut_buttons[5].configure(
+            text=f"5  撤到工作起点\n{app.workflow_start_var.get()} µm · {SHORTCUT_PRESETS[4][3]:g} µm/s"))
         queue_row = ttk.Frame(shortcuts)
         queue_row.pack(fill="x", pady=(4, 0))
         self.queue_status = ttk.Label(queue_row, textvariable=app.shortcut_status_var,
@@ -309,14 +316,20 @@ class PositionPanel(ttk.Frame):
             safe_lo, safe_hi = travel.command_bounds
             self.app.min_limit_var.set(f"{safe_lo:.2f}")
             self.app.max_limit_var.set(f"{safe_hi:.2f}")
+        self.axis_zeros[axis] = raw_um
         self.user_zero_um = raw_um
         self.user_zero_set = True
         self.position = raw_um
+        self.position_count = self.app._um_to_inc(raw_um)
         self.received_at = sample_time
         self.feedback_axis = axis
         self.encoder_view_center = raw_um
         self.target.set(repr(raw_um))
         self.show_full_travel()
+
+    def forget_axis_zero(self):
+        self.axis_zeros.pop(self.app.active_axis_var.get(), None)
+        self.clear_user_zero()
 
     def clear_user_zero(self):
         self.user_zero_um = 0.0
@@ -414,6 +427,8 @@ class PositionPanel(ttk.Frame):
         self.redraw()
 
     def invalidate_mapping(self):
+        if self.restoring_axis:
+            return
         self.app.travel_range.invalidate()
         self.app.travel_ranges.pop(self.app.active_axis_var.get(), None)
         self.center_checked.set(False)
@@ -512,10 +527,23 @@ class PositionPanel(ttk.Frame):
         self.app.travel_range = self.app.travel_ranges.get(axis, TravelRange())
         self.position = self.received_at = self.feedback_axis = None
         self.initialized_axis = None
-        self.clear_user_zero()
+        travel = self.app.travel_range
+        self.restoring_axis = True
+        try:
+            self.center_coordinate.set(f"{travel.center_um:.4f}")
+            self.end_margin.set(f"{travel.margin_um:g}")
+            self.center_checked.set(travel.confirmed)
+        finally:
+            self.restoring_axis = False
+        self.user_zero_set = axis in self.axis_zeros and travel.confirmed
+        self.user_zero_um = self.axis_zeros[axis] if self.user_zero_set else 0.0
+        self.encoder_view_center = self.user_zero_um
+        self.full_view = True
+        self._raw_target_changed()
         self.redraw()
 
     def invalidate(self):
+        self.axis_zeros.clear()
         self.app.travel_range.invalidate()
         self.app.travel_ranges.clear()
         self.center_checked.set(False)
@@ -526,6 +554,7 @@ class PositionPanel(ttk.Frame):
 
     def accept_status(self, status):
         if status is None:
+            self.axis_zeros.clear()
             self.app.travel_range.invalidate()
             self.app.travel_ranges.clear()
             self.center_checked.set(False)
@@ -538,6 +567,7 @@ class PositionPanel(ttk.Frame):
         if status.get("axis") != self.app.active_axis_var.get():
             return
         self.position = float(status["position_um"])
+        self.position_count = status.get("position_inc")
         self.received_at = status["sample_time"]
         self.feedback_axis = status["axis"]
         if self.initialized_axis != self.feedback_axis and self.is_fresh():
@@ -564,7 +594,7 @@ class PositionPanel(ttk.Frame):
             self.app._show_error(str(exc))
 
     def editing_locked(self):
-        return (self.app.command_busy or self.app.active_target_inc is not None
+        return (self.app.command_busy or self.app.start_confirmation is not None or self.app.active_target_inc is not None
                 or self.app.shortcut_active is not None or bool(self.app.shortcut_pending)
                 or self.app.stop_pending or self.app.stop_unconfirmed)
 
@@ -607,8 +637,6 @@ class PositionPanel(ttk.Frame):
         travel = self.app.travel_range
         for widget in (self.entry, self.scale, self.speed_entry, *self.speed_buttons):
             widget.configure(state="disabled" if locked else "normal")
-        self.encoder_check.configure(state="disabled" if locked else "normal")
-        verified = self.app.encoder_verified_var.get()
         linked = self.app.linked_mode_var.get()
         selected = set(self.app.shortcut_selected)
         active_number = (int(self.app.shortcut_active["number"])
@@ -622,15 +650,21 @@ class PositionPanel(ttk.Frame):
             state="normal" if self.app.shortcut_selected and selectable else "disabled")
         self.shortcut_dwell_entry.configure(state="disabled" if locked else "normal")
         default_ready = not self.app.default_limit_enabled or self.default_limit_active()
-        ready = (fresh and self.app.node is not None and not locked and not linked and verified
+        ready = (fresh and self.app.node is not None and not locked and not linked
                  and travel.confirmed and default_ready)
         if hasattr(self, "center_entry"):
             for widget in (self.center_entry, self.margin_entry, self.center_check,
                            self.default_limit_check, self.apply_travel_button):
                 widget.configure(state="disabled" if locked else "normal")
         self.scale.configure(state="disabled" if locked else "normal")
-        self.zero_button.configure(state="disabled" if locked or not fresh or linked or self.app.node is None else "normal")
-        if travel.confirmed and self.user_zero_set:
+        pending = self.app.reference_review is not None
+        self.zero_button.configure(text="复核零点" if pending else "收回端点置零",
+                                   state="disabled" if locked or not fresh or (linked and not pending)
+                                   or self.app.node is None or self.app.reconnect_reason else "normal")
+        if pending or self.app.reconnect_reason:
+            self.calibration_badge_text.set("需重新标定" if self.app.reconnect_reason else "零点待复核")
+            self.calibration_badge.configure(style="BadgeWarn.TLabel")
+        elif travel.confirmed and self.user_zero_set:
             self.calibration_badge_text.set("默认限位 · 0–13 mm" if self.default_limit_active() else "已置零 · 0–60 mm")
             self.calibration_badge.configure(style="BadgeReady.TLabel")
         elif travel.confirmed:
@@ -644,6 +678,8 @@ class PositionPanel(ttk.Frame):
             self.readiness_text.set("停止未确认 · 请关闭驱动器电源，再重新连接")
         elif self.app.stop_pending:
             self.readiness_text.set("正在停止 · 等待状态与位置确认")
+        elif self.app.reconnect_reason or pending:
+            self.readiness_text.set(self.app.reconnect_reason or "通信中断 · 请复核原零点")
         elif locked:
             self.readiness_text.set("命令执行中；STOP 可停止")
         elif self.app.node is None:
@@ -652,27 +688,32 @@ class PositionPanel(ttk.Frame):
             self.readiness_text.set("等待有效位置反馈")
         elif linked:
             self.readiness_text.set("请在高级设置中关闭双轴联动")
-        elif not verified:
-            self.readiness_text.set("请勾选“已核对实物标签”")
         elif not default_ready:
             self.readiness_text.set("默认限位已启用 · 请先完成收回端点置零")
         elif not travel.confirmed:
             self.readiness_text.set("实物在收回端点时：点击“收回端点置零”")
         else:
             self.readiness_text.set("已就绪 · 设置目标后点击开始运动")
-        can_submit = not locked and not self.app.stop_pending and not self.app.stop_unconfirmed
+        can_submit = not (locked or self.app.stop_pending or self.app.stop_unconfirmed or pending or self.app.reconnect_reason)
         self.start_button.configure(state="normal" if can_submit else "disabled")
         self.readiness_label.configure(style="StatusReady.TLabel" if ready else "StatusWarning.TLabel"
                                          if self.app.stop_unconfirmed else "Status.TLabel")
-        self.actual_text.set(f"{self.position - self.user_zero_um:,.2f}" if self.position is not None else "—")
-        self.app.user_position_var.set(f"{self.position - self.user_zero_um:.2f}" if fresh else "—")
-        coordinate = "用户坐标" if self.user_zero_set else "编码器 · 物理零点未标定"
-        self.actual_caption.set(f"当前位置 · {coordinate} µm" if fresh else "上次位置 · 反馈已过期 · µm" if self.position is not None else "当前位置 · 等待反馈 · µm")
+        relative = self.position - self.user_zero_um if self.user_zero_set and self.position is not None else None
+        self.actual_text.set(f"{relative:,.2f}" if relative is not None else "—")
+        self.app.user_position_var.set(f"{relative:.2f}" if fresh and relative is not None else "—")
+        caption = "当前位置 · 相对用户零点" if self.user_zero_set else "用户位置 · 尚未置零"
+        if self.position is not None and not fresh:
+            caption += " · 反馈已过期"
+        self.actual_caption.set(caption)
+        self.target_caption.set("目标 · 相对用户零点（µm）" if self.user_zero_set else "目标 · 编码器坐标（µm）")
+        raw_label = "编码器绝对位置" if fresh else "上次编码器位置"
+        counts = f"（{self.position_count} 计数）" if self.position_count is not None else ""
+        self.encoder_caption.set(f"{raw_label} {self.position:.2f} µm{counts}" if self.position is not None else "")
         target_lo, target_hi = self.target_bounds()
         self.zero_text.set(f"0 = 收回端点；可设目标 {target_lo-self.user_zero_um:.0f}–{target_hi-self.user_zero_um:.0f} µm" if self.user_zero_set and travel.confirmed else "实物在收回端尽头时置零；此操作不移动设备")
         self.actual_value_label.configure(foreground="#155DCC" if fresh else "#64748b")
         if fresh:
-            self.feedback_text.set(f"编码器反馈 · {time.monotonic() - self.received_at:.1f} s 前更新")
+            self.feedback_text.set(f"反馈 · {time.monotonic() - self.received_at:.1f} s 前更新")
         elif self.position is not None:
             self.feedback_text.set("反馈已过期 · 当前实际位置未确认")
         else:
@@ -868,7 +909,7 @@ class PositionPanel(ttk.Frame):
             c.create_text(
                 x + 34,
                 ay,
-                text=(f"当前 {actual_mm:+.2f} mm" if fresh else "上次 · 已过期")
+                text=(f"当前 {actual_mm:+.2f} mm" if fresh and self.user_zero_set else "当前位置" if fresh else "上次 · 已过期")
                 + ("" if in_view_a else " · 超出视图"),
                 anchor="w",
                 fill="#155DCC" if fresh else "#64748b",

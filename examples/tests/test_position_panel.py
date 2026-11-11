@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from control_gui import XeryonControlGui
 from position_panel import SPEEDS
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from verify_sequence_flow import SimulatedNode
 
 
 class PositionPanelTests(unittest.TestCase):
@@ -21,7 +23,6 @@ class PositionPanelTests(unittest.TestCase):
         self.node = SimpleNamespace(id=32)
         self.app.node = self.node
         self.app.nodes = {"Actuator A": self.node}
-        self.app.encoder_verified_var.set(True)
         self.app.default_limit_var.set(False)
         self.app.travel_range.confirm(0, 1000, "Actuator A")
         self.app._safe_start = Mock()
@@ -80,7 +81,8 @@ class PositionPanelTests(unittest.TestCase):
         self.assertFalse(self.panel.is_fresh())
         self.assertFalse(self.panel.canvas.find_withtag("actual"))
         self.assertTrue(self.panel.canvas.find_withtag("actual_stale"))
-        self.assertEqual(self.panel.actual_text.get(), "100.00")
+        self.assertEqual(self.panel.actual_text.get(), "—")
+        self.assertIn("上次编码器位置 100.00 µm", self.panel.encoder_caption.get())
         self.assertIn("已过期", self.panel.actual_caption.get())
         self.assertFalse(self.panel.start_button.instate(["disabled"]))
         self.panel.start()
@@ -121,7 +123,7 @@ class PositionPanelTests(unittest.TestCase):
         self.feedback(105)
         self.assertEqual(self.panel.target.get(), "300")
 
-    def test_invalid_targets_limits_encoder_and_linked_mode_block_start(self):
+    def test_invalid_targets_limits_and_linked_mode_block_start(self):
         for target in ("nan", "inf", "bad"):
             self.panel.target.set(target)
             self.panel.start()
@@ -132,10 +134,6 @@ class PositionPanelTests(unittest.TestCase):
         self.panel.start()
         self.app._safe_start.assert_not_called()
         self.app.limit_enabled_var.set(False)
-        self.app.encoder_verified_var.set(False)
-        self.panel.start()
-        self.app._safe_start.assert_not_called()
-        self.app.encoder_verified_var.set(True)
         self.app.linked_mode_var.set(True)
         self.panel.start()
         self.app._safe_start.assert_not_called()
@@ -163,6 +161,127 @@ class PositionPanelTests(unittest.TestCase):
             operation()
             move.assert_not_called()
 
+    def _setup_shifted_start(self, shortcut=False, zero=0, initial_offset=100):
+        app = self.app
+        app.inc_per_mm = 1000
+        self.panel.apply_user_zero(zero, time.monotonic())
+        self.feedback(zero + initial_offset)
+        self.panel.user_target.set("1000")
+        if shortcut:
+            app.toggle_shortcut(1)
+            app.toggle_shortcut(2)
+        app._read_actual_position_inc = Mock(side_effect=[zero + initial_offset, zero + 350])
+        app._read_statusword = Mock(return_value=0x40)
+        app._disable_drive_worker = Mock(return_value={32: {"position_inc": zero + 352, "statusword": 0x40}})
+        self.node.sdo = {key: SimpleNamespace(raw=0) for key in (
+            "Profile velocity", "Profile acceleration", "Max profile velocity", "Max acceleration",
+            "Quick stop deceleration", "Following error window", "Following error time out")}
+        self.node.sdo[0x60A4] = {1: SimpleNamespace(raw=0)}
+        app._prepare_profile_position = lambda node, profile, reference: app._write_profile(node, profile)
+        app._start_motion_trace = Mock()
+        app._command_profile_position = Mock()
+        self.panel.start()
+        self._finish_submitted_command()
+        app._command_profile_position.assert_not_called()
+        return app.start_confirmation
+
+    def _finish_submitted_command(self):
+        app = self.app
+        label, worker = app._safe_start.call_args.args
+        app.command_busy = True
+        app._command_runner(label, worker, app.cancel_generation)
+        while not app.ui_queue.empty():
+            app._handle_ui_event(*app.ui_queue.get_nowait())
+
+    def test_continue_recomputes_from_verified_stop_and_keeps_absolute_target(self):
+        zero = -18000
+        review = self._setup_shifted_start(zero=zero)
+        app = self.app
+        self.assertEqual(review.stopped_inc, zero + 352)
+        self.assertGreater(self.node.sdo[0x60A4][1].raw, 0)
+        self.assertNotIn("jerk_inc", review.motion.profile)
+        labels = [w.cget("text") for w in app.start_confirmation_window.winfo_children() if w.winfo_class() == "TLabel"]
+        self.assertTrue(any("新起点 +352.00" in s and "目标 +1000.00" in s for s in labels))
+        self.assertTrue(any("编码器绝对位置 -17648.00 µm" in s for s in labels))
+        self.assertTrue(app.test_stop_requested.is_set())
+        self.assertIsNone(app.grab_current())
+        app._read_actual_position_inc = Mock(side_effect=[zero + 353, zero + 354])
+        buttons = app.start_confirmation_window.winfo_children()[-1]
+        self.assertEqual([b.cget("text") for b in buttons.winfo_children()], ["继续", "取消"])
+        app.continue_button.invoke()
+        self._finish_submitted_command()
+        self.assertEqual(app.active_start_inc, zero + 354)
+        app._command_profile_position.assert_called_once_with(self.node, zero + 1000)
+        self.assertEqual(app.target_remaining_var.get(), "646.00")
+        app._continue_start(review)
+        self.assertEqual(app._safe_start.call_count, 2)
+
+    def test_changed_again_needs_new_confirmation_and_cancel_clears_shortcuts(self):
+        review = self._setup_shifted_start(shortcut=True)
+        app = self.app
+        self.assertEqual(review.motion.step["number"], 1)
+        self.assertEqual([step["number"] for step in app.shortcut_pending], [2])
+        app._read_actual_position_inc = Mock(return_value=600)
+        app._disable_drive_worker.return_value[32]["position_inc"] = 600
+        app._continue_start(review)
+        self._finish_submitted_command()
+        self.assertEqual(app.start_confirmation.stopped_inc, 600)
+        app._dismiss_start_confirmation()
+        self.assertIsNone(app.shortcut_active)
+        self.assertFalse(app.shortcut_pending)
+        app._command_profile_position.assert_not_called()
+
+    def test_stop_invalidates_open_confirmation(self):
+        review = self._setup_shifted_start()
+        with patch("control_gui.threading.Thread"):
+            self.app.stop_actuator_test()
+        self.app._continue_start(review)
+        self.assertIsNone(self.app.start_confirmation)
+        self.assertEqual(self.app._safe_start.call_count, 1)
+        self.app._command_profile_position.assert_not_called()
+
+    def test_changed_limits_cannot_resume_old_target(self):
+        review = self._setup_shifted_start()
+        self.app.limit_enabled_var.set(True)
+        self.app.min_limit_var.set("50")
+        self.app.max_limit_var.set("500")
+        self.app._continue_start(review)
+        self.assertIs(self.app.start_confirmation, review)
+        self.assertTrue(self.app.continue_button.instate(["disabled"]))
+        self.assertEqual(self.app._safe_start.call_count, 1)
+        self.app._command_profile_position.assert_not_called()
+        self.app._show_error.assert_not_called()
+        self.app._dismiss_start_confirmation()
+
+    def test_editing_target_requires_approval_of_updated_relative_preview(self):
+        review = self._setup_shifted_start(zero=-18000)
+        self.panel.user_target.set("1200")
+        self.app.continue_button.invoke()
+        revised = self.app.start_confirmation
+        self.assertIsNot(revised, review)
+        self.assertEqual(revised.motion.target, -16800)
+        self.app._command_profile_position.assert_not_called()
+        self.assertEqual(self.app._safe_start.call_count, 1)
+        labels = [w.cget("text") for w in self.app.start_confirmation_window.winfo_children()
+                  if w.winfo_class() == "TLabel"]
+        self.assertTrue(any("目标 +1200.00" in s and "预计位移 +848.00" in s for s in labels))
+        self.app._read_actual_position_inc = Mock(return_value=-17648)
+        self.app.continue_button.invoke()
+        self._finish_submitted_command()
+        self.app._command_profile_position.assert_called_once_with(self.node, -16800)
+
+    def test_unverified_stop_never_offers_continue(self):
+        app = self.app
+        self.panel.target.set("1000")
+        app._read_actual_position_inc = Mock(return_value=900)
+        app._disable_drive_worker = Mock(side_effect=RuntimeError("停止未确认"))
+        app._command_profile_position = Mock()
+        self.panel.start()
+        self._finish_submitted_command()
+        self.assertIsNone(app.start_confirmation)
+        app._show_error.assert_called_once_with("停止未确认")
+        app._command_profile_position.assert_not_called()
+
     def test_stop_during_prepare_never_sends_target(self):
         with patch.object(self.app, "_prepare_profile_position", side_effect=lambda *args: self.app.test_stop_requested.set()), \
              patch.object(self.app, "_read_actual_position_inc", return_value=100), \
@@ -181,26 +300,22 @@ class PositionPanelTests(unittest.TestCase):
         self.assertEqual(self.app._limits_snapshot(), limits)
         self.assertEqual((self.panel.view_min, self.panel.view_max), (50, 150))
 
-    def test_connected_user_can_confirm_label_without_changing_encoder_model(self):
-        self.app.encoder_verified_var.set(False)
+    def test_connected_user_can_start_with_configured_encoder_model(self):
         self.app._post("connected", True)
         self.app._drain_ui_queue()
         self.assertTrue(self.app.encoder_combo.instate(["disabled"]))
-        self.assertFalse(self.app.encoder_check.instate(["disabled"]))
-        self.assertFalse(self.panel.encoder_check.instate(["disabled"]))
-        self.assertFalse(self.panel.start_button.instate(["disabled"]))
-        self.panel.encoder_check.invoke()
-        self.assertTrue(self.app.encoder_verified_var.get())
         self.assertFalse(self.panel.start_button.instate(["disabled"]))
         self.panel.start_button.invoke()
         self.app._safe_start.assert_called_once()
 
-    def test_cancel_label_confirmation_disables_start_again(self):
-        self.panel.encoder_check.invoke()
-        self.assertFalse(self.app.encoder_verified_var.get())
-        self.assertFalse(self.panel.start_button.instate(["disabled"]))
-        self.panel.start_button.invoke()
-        self.app._safe_start.assert_not_called()
+    def test_shift_from_zero_explains_how_to_recapture_the_endpoint(self):
+        self._setup_shifted_start(zero=-18000, initial_offset=0)
+        labels = [w.cget("text") for w in self.app.start_confirmation_window.winfo_children()
+                  if w.winfo_class() == "TLabel"]
+        self.assertTrue(any("收回端点置零" in label for label in labels))
+        self.app._dismiss_start_confirmation()
+        self.assertEqual(self.panel.user_zero_um, -18000)
+        self.app._command_profile_position.assert_not_called()
 
     def test_full_stroke_and_zoom_do_not_change_slider_or_limits(self):
         self.panel.show_full_travel()
@@ -228,7 +343,8 @@ class PositionPanelTests(unittest.TestCase):
         self.panel.show_full_travel()
         self.assertTrue(self.panel.canvas.find_withtag("actual"))
         self.assertTrue(self.panel.canvas.find_withtag("target"))
-        self.assertEqual(self.panel.actual_text.get(), "-24,975.76")
+        self.assertEqual(self.panel.actual_text.get(), "—")
+        self.assertIn("-24975.76 µm", self.panel.encoder_caption.get())
         self.panel.slide_target(-24000)
         self.assertEqual(self.app.target_position_var.get(), "-24000.00")
         self.panel.span.set("1000")
@@ -254,7 +370,8 @@ class PositionPanelTests(unittest.TestCase):
     def test_transient_loss_preserves_reading_and_target_with_stale_label(self):
         self.panel.target.set("300")
         self.app._set_status(None)
-        self.assertEqual(self.panel.actual_text.get(), "100.00")
+        self.assertEqual(self.panel.actual_text.get(), "—")
+        self.assertIn("上次编码器位置 100.00 µm", self.panel.encoder_caption.get())
         self.assertIn("已过期",self.panel.actual_caption.get())
         self.assertTrue(self.panel.canvas.find_withtag("actual_stale"))
         self.assertTrue(self.panel.canvas.find_withtag("target"))
@@ -275,6 +392,10 @@ class PositionPanelTests(unittest.TestCase):
         self.app._safe_start.assert_not_called()
 
     def test_long_status_keeps_panels_accessible_in_compact_console(self):
+        # This geometry check supplies its own samples. Keep the periodic poll
+        # from contacting the mock node or continuously scheduling new UI work.
+        for timer in self.app.tk.call("after", "info"):
+            self.app.after_cancel(timer)
         self.app.geometry("1100x760+4000+100")
         self.app.deiconify()
         self.app.notebook.select(0)
@@ -374,6 +495,50 @@ class PositionPanelTests(unittest.TestCase):
         self.assertIsNone(self.app.grab_current())
         self.assertTrue(self.app.error_window.winfo_exists())
 
+    def test_notice_centers_on_owner_and_keeps_close_button_on_screen(self):
+        app = self.app
+        app.geometry("1100x760+40+20")
+        app.deiconify()
+        app.update_idletasks()
+        XeryonControlGui._show_error(app, "控制器提示")
+        notice = app.error_window
+        notice.update_idletasks()
+        self.assertAlmostEqual(notice.winfo_x() + notice.winfo_width() / 2,
+                               app.winfo_rootx() + app.winfo_width() / 2, delta=12)
+        self.assertAlmostEqual(notice.winfo_y() + notice.winfo_height() / 2,
+                               app.winfo_rooty() + app.winfo_height() / 2, delta=12)
+
+        app.geometry(f"1100x760+{app.winfo_screenwidth() - 200}+20")
+        app.update_idletasks()
+        XeryonControlGui._show_error(app, "更新后的较长提示。" * 15)
+        notice.update_idletasks()
+        self.assertIs(notice, app.error_window)
+        close = next(w for w in notice.winfo_children()
+                     if w.winfo_class() == "TButton" and w.cget("text") == "关闭提示")
+        self.assertLessEqual(close.winfo_rootx() + close.winfo_width(), app.winfo_screenwidth())
+        self.assertLessEqual(close.winfo_rooty() + close.winfo_height(), app.winfo_screenheight())
+        close.invoke()
+        self.assertFalse(notice.winfo_exists())
+
+    def test_close_notice_is_reused_and_requires_explicit_power_off_confirmation(self):
+        app = self.app
+        app.close_in_progress = True
+        with patch.object(app, "destroy") as exit_app:
+            app._show_close_notice()
+            notice = app.close_notice
+            buttons = {w.cget("text"): w for w in notice.winfo_children()
+                       if w.winfo_class() == "TButton"}
+            buttons["隐藏提示"].invoke()
+            app._show_close_notice()
+            self.assertEqual(notice.state(), "withdrawn")
+            XeryonControlGui._show_error(app, "停止状态未确认")
+            self.assertNotIn("error_window", app.__dict__)
+            app._on_close()
+            self.assertIs(app.close_notice, notice)
+            exit_app.assert_not_called()
+            buttons["已确认断电并停止，退出软件"].invoke()
+            exit_app.assert_called_once()
+
     def test_user_zero_changes_display_without_changing_device_frame(self):
         self.panel.apply_user_zero(100, time.monotonic())
         self.assertEqual(self.panel.actual_text.get(), "0.00")
@@ -404,18 +569,61 @@ class PositionPanelTests(unittest.TestCase):
         self.assertFalse(self.panel.user_zero_set)
         self.assertEqual(self.panel.user_zero_um,0)
 
-    def test_zero_capture_reads_only_and_rejects_moving_drive(self):
-        with patch.object(self.app,"_read_statusword",return_value=0x250), \
-             patch.object(self.app,"_read_actual_position_inc",side_effect=[-24780,-24780]), \
-             patch.object(self.app,"_write_controlword") as write, \
-             patch.object(self.app,"_post") as post:
-            self.app._capture_user_zero_worker(self.node,"Actuator A")
+    def test_disabled_feedback_tracks_manual_adjustment_with_same_zero_and_target(self):
+        self.panel.apply_user_zero(8000, time.monotonic())
+        self.panel.user_target.set("6000")
+        limits = self.app.travel_range.command_bounds
+        for raw, shown in ((13000, "5000.00"), (13200, "5200.00")):
+            count = self.app._um_to_inc(raw)
+            self.feedback(raw, position_inc=count, statusword=0x1250, state="SWITCH ON DISABLED")
+            self.assertEqual(self.app.user_position_var.get(), shown)
+            self.assertIn(f"{count} 计数", self.panel.encoder_caption.get())
+            self.assertEqual(self.panel.user_zero_um, 8000)
+            self.assertEqual(float(self.panel.target.get()), 14000)
+        self.assertEqual(self.app.travel_range.command_bounds, limits)
+        self.app._safe_start.assert_not_called()
+
+    def test_zero_button_rejects_already_enabled_drive(self):
+        with patch.object(self.app, "_read_statusword", return_value=0x237), \
+             patch.object(self.app, "_write_controlword") as write:
+            self.panel.zero_button.invoke()
+            self._finish_submitted_command()
+            self.app._show_error.assert_called_once()
             write.assert_not_called()
-            self.assertEqual(post.call_args.args[0],"user_zero")
-            self.assertAlmostEqual(post.call_args.args[1]["raw_um"],-24975.762)
-        with patch.object(self.app,"_read_statusword",return_value=0x237):
-            with self.assertRaises(ValueError):
-                self.app._capture_user_zero_worker(self.node,"Actuator A")
+            self.assertFalse(self.panel.user_zero_set)
+
+    def test_zero_result_applies_only_until_a_stop_request(self):
+        payload = {"node": self.node, "axis": "Actuator A", "generation": self.app.cancel_generation,
+                   "raw_um": -37000, "sample_time": time.monotonic()}
+        self.app._handle_ui_event("user_zero", payload)
+        self.assertEqual(self.panel.user_zero_um, -37000)
+        self.app.cancel_generation += 1
+        self.app._handle_ui_event("user_zero", dict(payload, raw_um=420))
+        self.assertEqual(self.panel.user_zero_um, -37000)
+
+    def test_one_zero_click_after_manual_move_then_first_start_uses_refreshed_origin(self):
+        app = self.app
+        node = SimulatedNode(origin=-27000)
+        app.node = app.nodes["Actuator A"] = node
+        self.feedback(app._inc_to_um(node.position), statusword=0x40)
+        write = node.write
+        def refresh_on_enable(index, value):
+            write(index, value)
+            if index == 0x6040 and value == 0x10F:
+                node.position = -35900
+        node.write = refresh_on_enable
+        self.panel.zero_button.invoke()
+        self._finish_submitted_command()
+        self.assertEqual(self.panel.user_zero_um, app._inc_to_um(-35900))
+        self.assertEqual(self.panel.actual_text.get(), "0.00")
+        self.assertEqual(node.commands, [])
+        self.panel.user_target.set("3350")
+        with patch.object(app, "_start_motion_trace"):
+            self.panel.start_button.invoke()
+            self._finish_submitted_command()
+        app._show_error.assert_not_called()
+        self.assertIsNone(app.start_confirmation)
+        self.assertEqual([cmd["target_inc"] for cmd in node.commands], [-35900 + app._um_to_inc(3350)])
 
     def test_endpoint_zero_places_body_at_top_and_derives_range(self):
         self.app.default_limit_var.set(True)
@@ -493,6 +701,25 @@ class PositionPanelTests(unittest.TestCase):
         self.assertEqual(float(self.panel.user_target.get()), -50)
         self.assertFalse(self.app.travel_range.confirmed)
         self.app._safe_start.assert_not_called()
+    def test_switching_back_restores_zero_and_review_survives_new_feedback(self):
+        self.panel.apply_user_zero(8000, time.monotonic())
+        self.app.active_axis_var.set("Actuator B")
+        self.assertFalse(self.panel.user_zero_set)
+        self.panel.apply_user_zero(3000, time.monotonic())
+        self.app.active_axis_var.set("Actuator A")
+        self.assertEqual(self.panel.user_zero_um, 8000)
+        self.assertEqual(self.panel.center_coordinate.get(), "38000.0000")
+        self.feedback(19000)
+        self.app._update_workflow_preview()
+        self.assertIn("慢速 11000.0 → 13000", self.app.workflow_preview_var.get())
+        self.app.reference_review = {"Actuator A": 19000}
+        self.app._handle_ui_event("feedback_stale", None)
+        self.feedback(19000)
+        self.assertEqual(self.panel.user_zero_um, 8000)
+        self.assertEqual(self.panel.zero_button.cget("text"), "复核零点")
+        with self.assertRaisesRegex(RuntimeError, "待复核"):
+            self.app._check_reference_ready()
+
     def test_axis_switch_preserves_each_axis_mechanical_mapping(self):
         from travel_range import TravelRange
         travel_a = TravelRange()

@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from dataclasses import dataclass, replace
 from math import ceil, floor, isfinite
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -42,15 +43,17 @@ if str(EXAMPLES_DIR) not in sys.path:
 from common.parameters import CANBitrate, EncoderRes, HomingMethod, NodeOperationMode, NodeState
 from repeatability import run_repeatability
 from position_panel import PositionPanel, SPEEDS
-from ui_theme import apply_theme
+from ui_theme import (MIN_CLIENT_HEIGHT, MIN_CLIENT_WIDTH, apply_theme,
+                      configure_startup_window, scrollable_work_area)
 from shortcut_presets import SHORTCUT_PRESETS
-from travel_range import DEFAULT_WORK_MAX_UM, DEFAULT_WORK_MIN_UM, TravelRange
+from travel_range import DEFAULT_WORK_MAX_UM, DEFAULT_WORK_MIN_UM, TravelRange, next_workflow_stage
 from stop_safety import verify_disabled
 from common.utils import (
     BIT,
     bound_can_write_timeout,
     error_handler,
     homing,
+    lss_read_identity_via_sdo,
     set_controlword,
     set_node_operation_mode,
     set_node_state,
@@ -113,16 +116,45 @@ FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
 
+@dataclass(frozen=True)
+class PanelMotion:
+    label: str
+    target: float
+    profile: dict
+    limits: dict
+    node: BaseNode402
+    axis: str
+    zero: float
+    zero_set: bool
+    displayed_inc: int
+    bounds: tuple
+    generation: int
+    step: Optional[dict]
+
+
+class StartupDisplacement(RuntimeError):
+    def __init__(self, message, previous_inc, stopped):
+        super().__init__(message)
+        self.previous_inc = previous_inc
+        self.stopped = stopped
+
+
+@dataclass(frozen=True)
+class StartConfirmation:
+    motion: PanelMotion
+    previous_inc: int
+    stopped_inc: int
+
+
 class XeryonControlGui(tk.Tk):
     """Motion-control GUI for one or two Xeryon actuators."""
 
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Xeryon 电极推进器控制台 · 20261106.38 紧凑界面版 · 基于 .34 诊断版 · 待实机验收")
+        self.title("Xeryon 电极推进器控制台 · 分段续行开发版 · 待实机验收")
         self.travel_range = TravelRange()
-        self.minsize(1100, 760)
-        self.geometry(f"{min(1320, self.winfo_screenwidth() - 60)}x{min(820, self.winfo_screenheight() - 80)}")
+        small_display = configure_startup_window(self)
         self.inc_per_mm = float(INC_PER_MM)
         self.test_results = []
         self.motion_trace_path = None
@@ -135,6 +167,7 @@ class XeryonControlGui(tk.Tk):
         self.io_lock = threading.RLock()
         self.controlword_lock = threading.Lock()
         self.stop_pending = False
+        self.stop_verified = False
         self.stop_unconfirmed = False
         self.cancel_generation = 0
         self.command_busy = False
@@ -149,6 +182,10 @@ class XeryonControlGui(tk.Tk):
         self.last_position_inc: Optional[int] = None
         self.runtime_position_window_inc = self._um_to_inc(20.0)
         self.linked_zero_offsets_inc: dict[str, int] = {}
+        self.reference_review = None
+        self.reconnect_reason = ""
+        self.reference_positions = {}
+        self.node_identities = {}
         self.travel_ranges: dict[str, TravelRange] = {}
         self.shortcut_active: Optional[dict[str, object]] = None
         self.shortcut_pending: list[dict[str, object]] = []
@@ -169,6 +206,10 @@ class XeryonControlGui(tk.Tk):
         self.disconnect_in_progress = False
         self.close_in_progress = False
         self.close_cleanup_started = False
+        self.close_stop_requested = False
+        self.close_notice = None
+        self.start_confirmation = None
+        self.start_confirmation_window = None
 
         self._build_style()
         self._build_variables()
@@ -177,7 +218,7 @@ class XeryonControlGui(tk.Tk):
         self.invert_b_var.trace_add("write", lambda *args: setattr(self, "invert_b_enabled", bool(self.invert_b_var.get())))
         self.default_limit_var.trace_add("write", lambda *args: setattr(self, "default_limit_enabled", bool(self.default_limit_var.get())))
         self.pair_tolerance_var.trace_add("write", lambda *args: self._sync_pair_tolerance())
-        self._build_layout()
+        self._build_layout(small_display)
         self._set_connected_state(False)
 
         self.after(100, self._drain_ui_queue)
@@ -193,10 +234,7 @@ class XeryonControlGui(tk.Tk):
         if not default_eds.exists():
             default_eds = (EXAMPLES_DIR / EDS_PATH).resolve()
 
-        self.serial_ports = self._serial_port_names()
-        default_channel = str(CAN_CHANNEL)
-        if self.serial_ports and default_channel not in self.serial_ports:
-            default_channel = self.serial_ports[0]
+        self.serial_ports, default_channel = self._serial_port_choices()
 
         self.interface_var = tk.StringVar(value=str(CAN_INTERFACE))
         self.channel_var = tk.StringVar(value=default_channel)
@@ -256,22 +294,20 @@ class XeryonControlGui(tk.Tk):
         self.test_return_var = tk.BooleanVar(value=False)
         self.test_settle_var = tk.StringVar(value="0.2")
         self.test_timeout_var = tk.StringVar(value="60")
-        self.workflow_center_var = tk.StringVar(value="50.0")
-        self.workflow_fast_distance_var = tk.StringVar(value="10000.0")
-        self.workflow_slow_distance_var = tk.StringVar(value="2950.0")
+        self.workflow_start_var = tk.StringVar(value="50")
+        self.workflow_switch_var = tk.StringVar(value="10050")
+        self.workflow_end_var = tk.StringVar(value="13000")
         self.workflow_fast_speed_var = tk.StringVar(value="50.0")
         self.workflow_slow_speed_var = tk.StringVar(value="5.0")
         self.workflow_fast_acceleration_var = tk.StringVar(value="500.0")
         self.workflow_travel_limit_var = tk.StringVar(value="15000.0")
         self.workflow_timeout_var = tk.StringVar(value="900")
-        self.workflow_positive_var = tk.BooleanVar(value=True)
-        self.workflow_disable_after_retreat_var = tk.BooleanVar(value=True)
+        self.workflow_preview_var = tk.StringVar(value="等待有效位置反馈")
         self.workflow_status_var = tk.StringVar(value="Ready")
         self.statusword_var = tk.StringVar(value="-")
         self.state_var = tk.StringVar(value="-")
         self.mode_var = tk.StringVar(value="-")
         self.encoder_var = tk.StringVar(value="1MU")
-        self.encoder_verified_var = tk.BooleanVar(value=False)
         self.repeat_cycles_var = tk.StringVar(value="3")
         self.repeat_span_var = tk.StringVar(value="10")
         self.repeat_speed_var = tk.StringVar(value="5")
@@ -281,7 +317,7 @@ class XeryonControlGui(tk.Tk):
     def _build_style(self) -> None:
         apply_theme(self)
 
-    def _build_layout(self) -> None:
+    def _build_layout(self, small_display: bool) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -292,8 +328,17 @@ class XeryonControlGui(tk.Tk):
 
         self._build_header(root)
 
-        notebook = ttk.Notebook(root, style="Main.TNotebook")
-        notebook.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        notebook_parent = root
+        if small_display:
+            header = self.header_title.master
+            viewport, notebook_parent = scrollable_work_area(
+                root, MIN_CLIENT_WIDTH - 24, MIN_CLIENT_HEIGHT - header.winfo_reqheight() - 24)
+            viewport.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        notebook = ttk.Notebook(notebook_parent, style="Main.TNotebook")
+        if small_display:
+            notebook.pack(fill="both", expand=True)
+        else:
+            notebook.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
 
         self.notebook = notebook
         notebook.bind("<<NotebookTabChanged>>", lambda event: self.page_var.set(notebook.index("current")))
@@ -394,17 +439,14 @@ class XeryonControlGui(tk.Tk):
         workflow = ttk.LabelFrame(parent, text="分段进退（长行程）", padding=(14, 10))
         workflow.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
         workflow.columnconfigure(1, weight=1)
-        self._entry(workflow, "中心坐标 (µm)", self.workflow_center_var, 0, 0)
-        self._entry(workflow, "快速段距离 (µm)", self.workflow_fast_distance_var, 1, 0)
-        self._entry(workflow, "慢速段距离 (µm)", self.workflow_slow_distance_var, 2, 0)
+        self._entry(workflow, "工作起点 (µm)", self.workflow_start_var, 0, 0)
+        self._entry(workflow, "快慢切换点 (µm)", self.workflow_switch_var, 1, 0)
+        self._entry(workflow, "推进终点 (µm)", self.workflow_end_var, 2, 0)
         self._entry(workflow, "快速段速度 (µm/s)", self.workflow_fast_speed_var, 3, 0)
         self._entry(workflow, "慢速段速度 (µm/s)", self.workflow_slow_speed_var, 4, 0)
         self._readonly(workflow, "阶段", self.workflow_status_var, 5, 0)
-        ttk.Checkbutton(
-            workflow,
-            text="正方向为推进方向",
-            variable=self.workflow_positive_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ttk.Label(workflow, textvariable=self.workflow_preview_var, wraplength=325).grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         workflow_buttons = ttk.Frame(workflow)
         workflow_buttons.grid(row=7, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
         for column in range(3):
@@ -427,14 +469,14 @@ class XeryonControlGui(tk.Tk):
             command=self.stop_standard_cycle,
         ).grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
-        motion = ttk.LabelFrame(parent, text="高级运动（原始编码器坐标）", padding=(14, 10))
+        motion = ttk.LabelFrame(parent, text="高级运动（单轴用户坐标 / 双轴联动坐标）", padding=(14, 10))
         motion.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
         motion.columnconfigure(1, weight=1)
         motion.columnconfigure(3, weight=1)
 
-        self._readonly(motion, "编码器位置 (µm)", self.position_var, 0, 0)
+        self._readonly(motion, "本轴用户位置 (µm)", self.user_position_var, 0, 0)
         self._readonly(motion, "剩余距离 (µm)", self.target_remaining_var, 0, 2)
-        self._entry(motion, "编码器目标 (µm)", self.target_position_var, 1, 0)
+        self._entry(motion, "目标位置 (µm)", self.position_panel.user_target, 1, 0)
         self._entry(motion, "速度 (µm/s)", self.velocity_var, 1, 2)
         ttk.Button(motion, text="移动到目标位置", style="Good.TButton", command=self.move_to_target).grid(
             row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(12, 6)
@@ -476,7 +518,7 @@ class XeryonControlGui(tk.Tk):
         actions.grid(row=7, column=0, columnspan=4, sticky="ew", padx=8, pady=(12, 4))
         actions.columnconfigure((0, 1, 2, 3), weight=1)
         ttk.Button(actions, text="寻找参考点", command=self.home_device).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(actions, text="移动到编码器 0", command=self.move_to_zero).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(actions, text="移到工作起点", command=self.move_to_work_start).grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(actions, text="驱动使能", command=self.enable_drive).grid(row=0, column=2, sticky="ew", padx=4)
         ttk.Button(actions, text="驱动失能", style="Danger.TButton", command=self.disable_drive).grid(
             row=0, column=3, sticky="ew", padx=(4, 0)
@@ -545,8 +587,6 @@ class XeryonControlGui(tk.Tk):
         self.encoder_combo = ttk.Combobox(connection, textvariable=self.encoder_var,
                                          values=["10MU", "1MU", "250NAN", "100NAN"], state="readonly")
         self.encoder_combo.grid(row=6, column=1, sticky="ew", padx=8)
-        self.encoder_check = ttk.Checkbutton(connection, text="已核对实物标签", variable=self.encoder_verified_var)
-        self.encoder_check.grid(row=6, column=2, columnspan=2, sticky="w")
         ttk.Checkbutton(
             connection,
             text="连接时复位",
@@ -572,7 +612,7 @@ class XeryonControlGui(tk.Tk):
 
         self._readonly(status, "Connection", self.connected_var, 0, 0)
         self._readonly(status, "Command", self.busy_var, 0, 2)
-        self._readonly(status, "Position (um)", self.position_var, 1, 0)
+        self._readonly(status, "编码器绝对位置 (µm)", self.position_var, 1, 0)
         self._readonly(status, "Target", self.target_status_var, 1, 2)
         self._readonly(status, "CiA-402 state", self.state_var, 2, 0)
         self._readonly(status, "Mode", self.mode_var, 2, 2)
@@ -796,15 +836,24 @@ class XeryonControlGui(tk.Tk):
         )
 
     @staticmethod
-    def _serial_port_names() -> list[str]:
-        return [port.device for port in list_ports.comports()]
+    def _serial_port_choices() -> tuple[list[str], str]:
+        ports = list_ports.comports()
+        names = [port.device for port in sorted(ports, key=lambda p: p.device.casefold())]
+        canable = [port.device for port in ports if (port.vid, port.pid) == (0xAD50, 0x60C4)]
+        configured = str(CAN_CHANNEL)
+        if len(canable) == 1:
+            return names, canable[0]
+        usb = [port.device for port in ports if port.vid is not None]
+        if configured not in names and len(usb) == 1:
+            return names, usb[0]
+        return names, configured
 
     def refresh_ports(self) -> None:
-        self.serial_ports = self._serial_port_names()
+        self.serial_ports, preferred = self._serial_port_choices()
         for combo in self.channel_combos:
             combo.configure(values=self.serial_ports)
-        if self.serial_ports and self.channel_var.get() not in self.serial_ports:
-            self.channel_var.set(self.serial_ports[0])
+        if self.node is None and self.serial_ports and self.channel_var.get() not in self.serial_ports:
+            self.channel_var.set(preferred)
         self._log(
             f"Serial ports: {', '.join(self.serial_ports)}"
             if self.serial_ports
@@ -852,7 +901,7 @@ class XeryonControlGui(tk.Tk):
                 "span_inc": self._parse_positive_int(self.repeat_span_var, "span counts"),
                 "speed_inc_s": self._parse_positive_int(self.repeat_speed_var, "speed counts/s"),
                 "axis": self.active_axis_var.get(), "profile": profile,
-                "encoder": self.encoder_var.get(), "encoder_verified": self.encoder_verified_var.get(),
+                "encoder": self.encoder_var.get(), "encoder_verified": False,
                 "output_dir": str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "XeryonControl" / "results"),
             }
             if not messagebox.askokcancel("空载往返测试", "确认推杆空载、处于中部且两端有余量。\n"
@@ -869,7 +918,7 @@ class XeryonControlGui(tk.Tk):
             self._show_error(str(exc))
 
     def disconnect_device(self) -> None:
-        if self.disconnect_in_progress:
+        if self.disconnect_in_progress or self.close_in_progress:
             return
         self.disconnect_in_progress = True
         self._cancel_shortcut_queue("快捷流程已断开")
@@ -909,11 +958,23 @@ class XeryonControlGui(tk.Tk):
         self._safe_start("Apply profile", lambda: self._apply_profile_worker(profile))
 
     def move_to_target(self) -> None:
-        target_um = self._parse_float(self.target_position_var, "target position")
-        profile = self._profile_snapshot()
-        limits = self._limits_snapshot()
-        linked = self._linked_snapshot(require_zero=True)
-        self._validate_target(target_um, limits)
+        try:
+            self._check_reference_ready()
+            panel = self.position_panel
+            if not panel.is_fresh():
+                raise ValueError("请等待有效的位置反馈。")
+            linked = self._linked_snapshot(require_zero=True)
+            if not linked["enabled"] and not panel.user_zero_set:
+                raise ValueError("请先确认本轴收回端点零点。")
+            target_um = self._parse_float(panel.user_target, "目标位置")
+            if not linked["enabled"]:
+                target_um += panel.user_zero_um
+            profile = self._profile_snapshot()
+            limits = self._limits_snapshot()
+            self._validate_target(target_um, limits)
+        except (ValueError, RuntimeError) as exc:
+            self._show_error(str(exc))
+            return
 
         def start() -> None:
             self._reset_motion_cancel()
@@ -931,7 +992,7 @@ class XeryonControlGui(tk.Tk):
         self._log("收到“开始运动”点击；快捷选择：" + (" → ".join(map(str, selected)) if selected else "无"))
         self.target_status_var.set("正在检查所选快捷流程" if selected else "正在检查运动参数")
         try:
-            if (self.command_busy or self.active_target_inc is not None
+            if (self.start_confirmation is not None or self.command_busy or self.active_target_inc is not None
                     or self.shortcut_active is not None or self.shortcut_pending):
                 raise ValueError("运动或快捷流程正在进行，请等待完成或先停止。")
             if self.shortcut_selected:
@@ -942,8 +1003,6 @@ class XeryonControlGui(tk.Tk):
                 raise ValueError("实时位置页用于单轴控制，请先在高级控制中关闭双轴联动。")
             if not panel.is_fresh():
                 raise ValueError("尚无有效的实时位置，请连接设备并等待编码器反馈。")
-            if not self.encoder_verified_var.get():
-                raise ValueError("请核对实物编码器型号，并勾选主界面的“已核对实物标签”。")
             target = self._parse_float(panel.target, "目标位置")
             self.travel_range.validate(target, self._um_to_inc(target), self._inc_to_um(1), self.active_axis_var.get())
             speed = self._parse_positive_float(panel.speed, "速度")
@@ -952,15 +1011,8 @@ class XeryonControlGui(tk.Tk):
             profile = self._profile_snapshot(velocity_override=speed)
             limits = self._limits_snapshot()
             self._validate_target(target, limits)
-            axis = self._active_axis_name()
             self._reset_motion_cancel()
-            def start():
-                if self.test_stop_requested.is_set():
-                    return
-                if self._require_node() is not node or self._active_axis_name() != axis:
-                    raise RuntimeError("活动轴已改变，运动未开始。")
-                self._move_absolute_worker(target, profile, limits)
-            self._safe_start("开始运动", start)
+            self._submit_panel_move("开始运动", target, profile, limits, node)
         except Exception as exc:
             self.target_status_var.set("未启动 · 请查看提示或运行日志")
             self._log(f"开始运动未执行：{exc}")
@@ -980,14 +1032,14 @@ class XeryonControlGui(tk.Tk):
             raise ValueError("快捷指令仅用于单轴控制，请先关闭双轴联动。")
         if not panel.is_fresh():
             raise ValueError("尚无有效的实时位置，请连接设备并等待编码器反馈。")
-        if not self.encoder_verified_var.get():
-            raise ValueError("请先核对实物编码器型号，并勾选“已核对实物标签”。")
         if not panel.user_zero_set or not self.travel_range.confirmed:
             raise ValueError("请先将推杆置于收回端点，并点击“实物当前位置 = 0”。")
         if not 2 <= speed <= 500:
             raise ValueError("序列速度须在 2–500 µm/s 范围内。")
 
         axis = self._active_axis_name()
+        if number == 5:
+            user_target = self._parse_float(self.workflow_start_var, "工作起点")
         target = panel.user_zero_um + user_target
         try:
             self.travel_range.validate(target, self._um_to_inc(target), self._inc_to_um(1), axis)
@@ -1085,33 +1137,56 @@ class XeryonControlGui(tk.Tk):
     def _start_shortcut_step(self, step: dict[str, object]) -> None:
         number = int(step["number"])
         name = str(step["name"])
-        generation = int(step["generation"])
         self.position_panel.user_target.set(f"{float(step['user_target']):.2f}")
         self.position_panel.speed.set(f"{float(step['speed']):g}")
         self.velocity_var.set(f"{float(step['speed']):g}")
         self._reset_motion_cancel()
 
-        def start() -> None:
-            try:
-                if self.shortcut_active is not step or int(step["generation"]) != self.shortcut_generation:
-                    raise RuntimeError("快捷流程已取消。")
-                if self.test_stop_requested.is_set():
-                    raise RuntimeError("快捷流程已被 STOP 取消。")
-                if self._require_node() is not step["node"] or self._active_axis_name() != step["axis"]:
-                    raise RuntimeError("活动轴已改变，快捷流程未开始。")
-                self._move_absolute_worker(
-                    float(step["target"]),
-                    dict(step["profile"]),
-                    dict(step["limits"]),
-                )
-            except Exception as exc:
-                self._post("shortcut_failed", {"generation": generation, "reason": str(exc)})
-                raise
-
-        if self._safe_start(f"快捷 {number} · {name}", start) is False:
+        if self._submit_panel_move(f"快捷 {number} · {name}", float(step["target"]),
+                                   step["profile"], step["limits"], step["node"], step) is False:
             raise RuntimeError("快捷步骤未提交，序列已取消；请查看运行日志。")
         self._update_shortcut_status()
         self.position_panel.redraw()
+
+    def _submit_panel_move(self, label, target, profile, limits, node, step=None):
+        panel = self.position_panel
+        motion = PanelMotion(label, target, dict(profile), dict(limits), node,
+                             self._active_axis_name() if step is None else step["axis"],
+                             panel.user_zero_um, panel.user_zero_set, self._um_to_inc(panel.position),
+                             self.travel_range.command_bounds,
+                             self.cancel_generation, step)
+        return self._dispatch_panel_move(motion)
+
+    def _dispatch_panel_move(self, motion, approved_start=None):
+        def start():
+            try:
+                if motion.generation != self.cancel_generation:
+                    raise RuntimeError("启动请求已取消。")
+                if motion.step is not None and (self.shortcut_active is not motion.step or
+                                                motion.step["generation"] != self.shortcut_generation):
+                    raise RuntimeError("快捷流程已取消。")
+                if self.test_stop_requested.is_set():
+                    return
+                if self._require_node() is not motion.node or self._active_axis_name() != motion.axis:
+                    raise RuntimeError("活动轴已改变，运动未开始。")
+                if approved_start is not None and not self._operation_disabled(
+                        self._read_statusword(motion.node, fresh=True)):
+                    raise RuntimeError("等待确认期间驱动状态已改变，继续请求已取消。")
+                expected = motion.displayed_inc if approved_start is None else approved_start
+                # The driver adds derived jerk values to its working profile.
+                # Keep the operator's original settings for the confirmation check.
+                self._move_absolute_worker(motion.target, dict(motion.profile), motion.limits,
+                                           expected_start_inc=expected)
+            except StartupDisplacement as exc:
+                stopped = exc.stopped.get(motion.node.id) if isinstance(exc.stopped, dict) else None
+                if stopped and self._operation_disabled(stopped["statusword"]):
+                    return StartConfirmation(motion, exc.previous_inc, stopped["position_inc"])
+                self._post_shortcut_failure(str(exc))
+                raise
+            except Exception as exc:
+                self._post_shortcut_failure(str(exc))
+                raise
+        return self._safe_start(motion.label, start)
 
     def _update_shortcut_status(self) -> None:
         active = self.shortcut_active
@@ -1241,36 +1316,59 @@ class XeryonControlGui(tk.Tk):
             if panel.editing_locked() or not panel.is_fresh() or self.linked_mode_var.get():
                 raise ValueError("请先停止单轴运动，并等待有效位置反馈。")
             node, axis = self._require_node(), self.active_axis_var.get()
-            self._safe_start("设置用户零点", lambda: self._capture_user_zero_worker(node, axis))
+            self._safe_start("刷新编码器并置零", lambda: self._capture_user_zero_worker(node, axis))
         except Exception as exc:
             self._show_error(str(exc))
 
     def _capture_user_zero_worker(self, node, axis):
+        generation = self.cancel_generation
+        self._reset_motion_cancel()
+        self._check_motion_cancelled()
         status = self._read_statusword(node, fresh=True)
-        if not ((status & 0x4F) == 0x40 or (status & 0x6F) in (0x21, 0x23)):
+        if not self._operation_disabled(status):
             raise ValueError("请先 STOP，确认驱动器失能后再置零。")
         first = self._read_actual_position_inc(node, fresh=True)
         time.sleep(0.15)
-        last = self._read_actual_position_inc(node, fresh=True)
-        if abs(last-first) > 1:
+        baseline = self._read_actual_position_inc(node, fresh=True)
+        if abs(baseline - first) > 1:
             raise ValueError("位置仍在变化，未设置零点。")
-        self._post("user_zero", {"axis":axis, "node":node, "raw_um":self._inc_to_um(last), "sample_time":time.monotonic()})
+        try:
+            self._switch_on_for_position_mode(node, baseline)
+            self._initialize_enable_hold(node, baseline)
+            # Bit 8 requests Halt throughout Operation Enabled. Bit 4 (new setpoint)
+            # stays clear. The first enabled sample may differ from the disabled latch.
+            halt_enabled = 0x0F | BIT(8)
+            self._motion_state(node, halt_enabled, 0x6F, 0x27)
+            enabled = self._read_actual_position_inc(node, fresh=True)
+            if int(node.sdo[0x6040].raw) != halt_enabled:
+                raise RuntimeError("Halt 控制字未确认，未设置零点。")
+            if int(node.sdo[0x6061].raw) != NodeOperationMode.PROFILE_POSITION.value:
+                raise RuntimeError("位置模式未确认，未设置零点。")
+            settle_until = time.monotonic() + 0.15
+            while True:
+                self._check_motion_cancelled()
+                last = self._read_actual_position_inc(node, fresh=True)
+                if abs(last - enabled) > 1 or self._read_statusword(node, fresh=True) & 0x6F != 0x27:
+                    raise ValueError("使能采样期间位置或驱动状态发生变化，未设置零点。")
+                remaining = settle_until - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.test_stop_requested.wait(min(0.025, remaining))
+        finally:
+            stopped = self._disable_drive_worker(only_node=node)[node.id]
+        self._check_motion_cancelled()
+        position = stopped["position_inc"]
+        if (not self._operation_disabled(stopped["statusword"])
+                or abs(position - enabled) > 1 or abs(position - last) > 1):
+            raise ValueError("失能后的反馈与使能采样不一致，未设置零点。")
+        self._post("log", f"置零采样 · 节点 {node.id} · 使能前读数 {baseline} → 使能实读 {enabled} "
+                   f"→ 停稳 {position} 计数")
+        self._post("user_zero", {"axis": axis, "node": node, "generation": generation,
+                                 "raw_um": self._inc_to_um(position), "sample_time": time.monotonic()})
 
-    def move_to_zero(self) -> None:
-        self.target_position_var.set("0.0")
-        profile = self._profile_snapshot()
-        limits = self._limits_snapshot()
-        linked = self._linked_snapshot(require_zero=True)
-        self._validate_target(0.0, limits)
-
-        def start() -> None:
-            self._reset_motion_cancel()
-            if bool(linked["enabled"]):
-                self._move_linked_absolute_worker(0.0, profile, limits, linked)
-            else:
-                self._move_absolute_worker(0.0, profile, limits)
-
-        self._safe_start("Move to zero", start)
+    def move_to_work_start(self) -> None:
+        self.position_panel.user_target.set(self.workflow_start_var.get())
+        self.move_to_target()
 
     def move_relative(self, direction: int) -> None:
         distance_um = self._parse_positive_float(self.relative_distance_var, "relative distance")
@@ -1369,7 +1467,12 @@ class XeryonControlGui(tk.Tk):
         self._disable_drive_worker()
 
     def run_standard_cycle(self, retreat: bool) -> None:
-        config = self._workflow_snapshot()
+        try:
+            config = self._workflow_snapshot()
+            self._require_node()
+        except (ValueError, RuntimeError) as exc:
+            self._show_error(str(exc))
+            return
 
         def start() -> None:
             self._reset_motion_cancel()
@@ -1377,24 +1480,57 @@ class XeryonControlGui(tk.Tk):
 
         self._safe_start("Retreat" if retreat else "Approach", start)
 
+    def _update_workflow_preview(self):
+        panel = self.position_panel
+        try:
+            self._check_reference_ready()
+            if not panel.is_fresh():
+                raise ValueError("等待当前轴位置反馈")
+            if self._linked_mode_enabled():
+                linked = self._linked_snapshot(require_zero=True)
+                if self.pair_error_var.get() == "-":
+                    raise ValueError("等待双轴联动坐标反馈")
+                positions = [float(self.position_a_var.get()), float(self.position_b_var.get())]
+                if max(positions) - min(positions) > linked["tolerance_um"]:
+                    raise ValueError("双轴位置差超过容差")
+            else:
+                if not panel.user_zero_set or not self.travel_range.confirmed:
+                    raise ValueError("请确认本轴收回端点零点和行程")
+                positions = [panel.position - panel.user_zero_um]
+            start, switch, end = (self._parse_float(v, name) for v, name in (
+                (self.workflow_start_var, "工作起点"), (self.workflow_switch_var, "切换点"),
+                (self.workflow_end_var, "终点")))
+            window = self._inc_to_um(self._um_to_inc(self._parse_positive_float(self.position_window_var, "到位窗口")))
+            current = " / ".join(f"{value:.1f}" for value in positions)
+            lines = []
+            for label, retreat in (("推进", False), ("退出", True)):
+                stage = next_workflow_stage(positions, start, switch, end, window, retreat)
+                lines.append(f"{label}：{stage[1]} {current} → {stage[0]:g} µm" if stage else f"{label}：已到位")
+            preview = "\n".join(lines)
+        except (ValueError, RuntimeError) as exc:
+            preview = str(exc)
+        if preview != self.workflow_preview_var.get():
+            self.workflow_preview_var.set(preview)
+
     def stop_standard_cycle(self) -> None:
         self._cancel_shortcut_queue("快捷流程已停止")
         self.test_stop_requested.set()
         self._run_stop_command("Stop cycle", self._quick_stop_worker)
 
-    def _safe_start(self, label: str, func: Callable[[], None]) -> bool:
-        def wrapped() -> None:
-            func()
-
+    def _safe_start(self, label: str, func: Callable[[], object]) -> bool:
         try:
-            self._run_command(label, wrapped)
+            self._run_command(label, func)
             return True
         except Exception as exc:
             self._log(f"{label} not started: {exc}")
             self._show_error(str(exc))
             return False
 
-    def _run_command(self, label: str, func: Callable[[], None]) -> None:
+    def _run_command(self, label: str, func: Callable[[], object]) -> None:
+        if self.__dict__.get("start_confirmation") is not None and label != "Disconnect":
+            raise RuntimeError("请先继续或取消待确认的运动。")
+        if label not in ("Disconnect", "Connect", "复核零点"):
+            self._check_reference_ready()
         if label != "Disconnect" and (self.__dict__.get("close_in_progress", False)
                                       or self.__dict__.get("disconnect_in_progress", False)):
             raise RuntimeError("正在停止并断开设备，不能提交新命令。")
@@ -1420,11 +1556,15 @@ class XeryonControlGui(tk.Tk):
         self._log(f"{label} 已提交后台执行。")
 
     def _run_stop_command(self, label: str, func: Callable[[], None]) -> None:
+        self._dismiss_start_confirmation()
         if self.stop_pending:
+            return
+        if self.__dict__.get("close_in_progress") and label != "Close":
             return
         if not self.nodes:
             self.target_status_var.set("未连接设备 · 无法确认停止，请使用硬件停止")
             return
+        self.stop_verified = False
         self.stop_pending = True
         self.cancel_generation += 1
         self.test_stop_requested.set()
@@ -1446,20 +1586,26 @@ class XeryonControlGui(tk.Tk):
             self.target_status_var.set("停止超时未确认 · 请关闭驱动器电源")
             self._show_error(f"STOP 已请求，但 {self.__dict__.get('stop_deadline_seconds', 3.0):.1f} 秒内未确认停止。请关闭驱动器电源。")
 
-    def _command_runner(self, label: str, func: Callable[[], None], generation=None) -> None:
+    def _command_runner(self, label: str, func: Callable[[], object], generation=None) -> None:
+        completion = ("busy", "Idle")
         try:
             with self.io_lock:
                 if generation is not None and generation != self.cancel_generation:
                     raise RuntimeError("命令已被 STOP 取消")
+                if label not in ("Disconnect", "Connect", "复核零点"):
+                    self._check_reference_ready()
                 self._motion_generation = generation
-                func()
-            self._post("log", f"{label} complete.")
+                result = func()
+            if isinstance(result, StartConfirmation):
+                completion = ("review_start", result)
+            else:
+                self._post("log", f"{label} complete.")
         except Exception as exc:
             error_handler(exc)
             self._post("log", f"{label} failed: {exc}")
             self._post("error", str(exc))
         finally:
-            self._post("busy", "Idle")
+            self._post(*completion)
 
     def _stop_runner(self, label: str, func: Callable[[], None]) -> None:
         try:
@@ -1476,6 +1622,7 @@ class XeryonControlGui(tk.Tk):
             try:
                 # Every UI stop route uses the same verified disable path.
                 self._stop_and_disable_worker()
+                self.stop_verified = True
             finally:
                 self.io_lock.release()
             self._post("log", f"{label} complete.")
@@ -1537,6 +1684,9 @@ class XeryonControlGui(tk.Tk):
             self._post("connected", False)
             raise
 
+        self.reference_positions = {}
+        self.reference_review = None
+        self.reconnect_reason = ""
         self.network = network
         self.stop_unconfirmed = False
         self.nodes = node_map
@@ -1595,6 +1745,61 @@ class XeryonControlGui(tk.Tk):
         node.rpdo_pointers.pop(0x6040, None)
         node.nmt.state = "OPERATIONAL"
 
+        try:
+            identity = lss_read_identity_via_sdo(node)
+        except Exception:
+            identity = None
+            self._post("log", f"Node {node.id}: 身份读取失败，通信中断后须重新标定。")
+        self.node_identities[node.id] = identity
+        node.nmt.add_heartbeat_callback(lambda state: self._on_node_boot(node, state))
+
+    def _on_node_boot(self, node, state):
+        if state == 0 and any(current is node for current in self.nodes.values()):
+            self.reconnect_reason = f"节点 {node.id} 已重启，请断开重连并重新标定。"
+            self.test_stop_requested.set()
+            self._post("node_boot", node)
+
+    def _check_reference_ready(self):
+        if self.__dict__.get("reconnect_reason"):
+            raise RuntimeError(self.reconnect_reason)
+        if self.__dict__.get("reference_review") is not None:
+            raise RuntimeError("通信中断后零点待复核，请点击「复核零点」。")
+
+    def review_reference(self):
+        def review():
+            anchors = self.reference_review
+            if self.reconnect_reason or anchors is None:
+                raise RuntimeError(self.reconnect_reason or "没有需要复核的零点。")
+            limit = max(2, self._um_to_inc(POSITION_REFERENCE_TOLERANCE_UM))
+            for axis, node in self.nodes.items():
+                identity = self.node_identities.get(node.id)
+                if not identity or not identity[-1] or lss_read_identity_via_sdo(node) != identity:
+                    reason = f"{axis} 设备身份无法确认"
+                elif axis not in anchors:
+                    reason = f"{axis} 缺少故障前的位置记录"
+                else:
+                    try:
+                        result = verify_disabled(node)
+                    except Exception:
+                        self.stop_unconfirmed = True
+                        raise
+                    if result["statusword"] & BIT(3):
+                        raise RuntimeError(f"{axis} 驱动器故障，零点仍待复核。")
+                    if abs(result["position_inc"] - anchors[axis]) <= limit:
+                        continue
+                    raise RuntimeError(
+                        f"{axis} 通信中断前后位置发生变化，零点仍待复核。"
+                        f"请核对故障前的参考位置（编码器 {self._inc_to_um(anchors[axis]):.2f} µm）"
+                        "后再次复核；若确认编码器基准已丢失，请重连并重新标定。"
+                    )
+                self.reconnect_reason = reason + "，请断开重连并重新标定。"
+                raise RuntimeError(self.reconnect_reason)
+            if self.reconnect_reason:
+                raise RuntimeError(self.reconnect_reason)
+            self.reference_review = None
+            self._post("target", "零点复核通过 · 请重新选择运动")
+        self._safe_start("复核零点", review)
+
     def _probe_node_ids_worker(self, probe: dict[str, object]) -> list[int]:
         network = None
         try:
@@ -1651,10 +1856,10 @@ class XeryonControlGui(tk.Tk):
         if not found_any:
             self._post("log", "No CANopen node IDs found at common bitrates.")
 
-    def _disconnect_worker(self) -> None:
+    def _disconnect_worker(self, *, verify_stop: bool = True) -> None:
         disable_error = None
         try:
-            if self.node is not None:
+            if verify_stop and self.node is not None:
                 try:
                     self._disable_drive_worker()
                 except Exception as exc:
@@ -1663,6 +1868,10 @@ class XeryonControlGui(tk.Tk):
             if self.network is not None:
                 self.network.disconnect()
         finally:
+            self.reference_review = None
+            self.reconnect_reason = ""
+            self.reference_positions = {}
+            self.node_identities = {}
             self.network = None
             self.node = None
             self.nodes = {}
@@ -1679,6 +1888,12 @@ class XeryonControlGui(tk.Tk):
 
     def _read_device_worker(self) -> None:
         node = self._require_node()
+        actual = self._read_actual_position_inc(node, fresh=True)
+        try:
+            internal = str(int(node.sdo[0x6063].raw))
+        except (KeyError, SdoAbortedError):
+            internal = "设备未提供"
+        self._post("log", f"位置读回：0x6064 实际位置 = {actual} 计数，0x6063 内部位置 = {internal}")
 
         velocity = self._inc_to_um(float(node.sdo["Profile velocity"].raw))
         acceleration = self._inc_to_um(float(node.sdo["Profile acceleration"].raw))
@@ -1735,8 +1950,8 @@ class XeryonControlGui(tk.Tk):
         target_um: float,
         profile: dict[str, float | int],
         limits: dict[str, float | bool],
+        *, expected_start_inc: Optional[int] = None,
     ) -> None:
-        self._invalidate_linked_zero("single-axis move")
         node = self._require_node()
         target_inc = self._um_to_inc(target_um)
 
@@ -1747,9 +1962,11 @@ class XeryonControlGui(tk.Tk):
         if bool(limits.get("enabled", False)):
             self._apply_limits_worker(limits)
         baseline = self._read_actual_position_inc(node, fresh=True)
+        if expected_start_inc is not None:
+            self._check_position_reference(expected_start_inc, baseline)
         previous = self.last_position_inc
         if previous is not None:
-            self._check_position_reference(previous, baseline)
+            self._check_position_reference(previous, baseline, idle_node=node)
         try:
             self._prepare_profile_position(node, profile, baseline)
             if self.test_stop_requested.is_set():
@@ -1757,8 +1974,11 @@ class XeryonControlGui(tk.Tk):
                 return
             start_inc = self._read_actual_position_inc(node, fresh=True)
             self._check_position_reference(baseline, start_inc)
+            if expected_start_inc is not None and expected_start_inc != baseline:
+                self._check_position_reference(expected_start_inc, start_inc)
 
             self._start_motion_trace(node, start_inc, target_inc, profile)
+            self._invalidate_linked_zero("single-axis move")
             self._command_profile_position(node, target_inc)
             self._post("target_coordinate", self._inc_to_um(target_inc))
 
@@ -1782,7 +2002,7 @@ class XeryonControlGui(tk.Tk):
             self._post("target_moved", "0.00")
             self._post("target_remaining", f"{self._inc_to_um(target_inc - start_inc):.2f}")
             self._post("target_progress", "0.0%")
-            self._post("target", f"{target_um:.2f} um")
+            self._post("single_axis_target", ("目标", target_um))
             self._post("log", f"Commanded absolute target {target_um:.2f} um.")
         except Exception:
             if not self.test_stop_requested.is_set():
@@ -1890,28 +2110,17 @@ class XeryonControlGui(tk.Tk):
 
     def _run_standard_cycle_worker_impl(self, config: dict[str, object], retreat: bool) -> None:
         linked = self._linked_snapshot(require_zero=True)
-        if bool(linked["enabled"]):
-            self._run_linked_standard_cycle_worker(config, retreat, linked)
-            return
-        panel = self.__dict__.get("position_panel")
-        if panel is None or not panel.user_zero_set or not self.travel_range.confirmed:
-            raise ValueError("分段流程使用绝对坐标，请先完成收回端点置零。")
-
-        self._invalidate_linked_zero("single-axis Standard Cycle")
-        node = self._require_node()
-        axis = self._active_axis_name()
-        center = float(config["center"])
-        direction = float(config["direction"])
-        fast_distance = float(config["fast_distance"])
-        slow_distance = float(config["slow_distance"])
-        fast_target = center + direction * fast_distance
-        final_target = fast_target + direction * slow_distance
+        paired = bool(linked["enabled"])
+        panel = self.position_panel
+        if not paired and (not panel.user_zero_set or not self.travel_range.confirmed):
+            raise ValueError("分段流程需要已确认的收回端点零点，请先置零。")
+        offset = 0.0 if paired else panel.user_zero_um
+        start, switch, end = (float(config[key]) for key in ("start", "switch", "end"))
         limits = dict(config["limits"])
         base_profile = dict(config["profile"])
         timeout = float(config["timeout"])
-
-        for target in (center, fast_target, final_target):
-            self._validate_target(target, limits)
+        axis = self._active_axis_name()
+        node = self._require_node()
 
         def profile_for(speed: float, acceleration: float, quick_stop: float) -> dict[str, object]:
             if speed > float(base_profile["max_velocity"]):
@@ -1951,152 +2160,80 @@ class XeryonControlGui(tk.Tk):
             float(base_profile["quick_stop_decel"]),
         )
 
-        self._apply_limits_worker(limits)
-        self._post(
-            "settings",
-            {"limits_enabled": True, "min_limit": limits["min"], "max_limit": limits["max"]},
-        )
-        current = self._inc_to_um(self._read_actual_position_inc(node, fresh=True))
-        progress = direction * (current - center)
-        if not retreat and abs(current - center) > 100.0:
-            raise RuntimeError(f"Approach must start within 100 um of center {center:.2f} um; current is {current:.2f} um.")
+        window = self._inc_to_um(int(base_profile["position_window_inc"]))
+        low_inc, high_inc = self._limit_count_bounds(limits["min"], limits["max"])
 
-        if retreat:
-            stages = []
-            if progress > fast_distance:
-                stages.append(("Slow retreat", fast_target, slow_profile))
-            stages.append(("Fast return", center, fast_profile))
-        else:
-            stages = [
-                ("Fast approach", fast_target, fast_profile),
-                ("Slow approach", final_target, slow_profile),
-            ]
+        def checked_target(user_target):
+            raw = offset + user_target
+            if not limits["min"] <= raw <= limits["max"]:
+                raise ValueError(f"分段目标 {user_target:g} µm 超出工作限位。")
+            # At a geometric endpoint, choose a reachable count inside the limit.
+            count = min(high_inc, max(low_inc, self._um_to_inc(raw)))
+            quantized = self._inc_to_um(count)
+            self._validate_target(quantized, limits)
+            if paired:
+                self._validate_linked_targets(self._linked_targets_for_logical_position(quantized, linked), linked)
+            return count
 
-        for step_no, (label, target, profile) in enumerate(stages, 1):
-            if self.test_stop_requested.is_set():
-                self._post("workflow_status", "Stopped")
+        for waypoint in (start, switch, end):
+            checked_target(waypoint)
+
+        def read_positions():
+            if paired:
+                positions = list(self._read_linked_logical_positions(linked, fresh=True).values())
+                if max(positions) - min(positions) > linked["tolerance_um"]:
+                    raise ValueError("双轴位置差超过联动容差，请核对两轴位置。")
+            else:
+                positions = [self._inc_to_um(self._read_actual_position_inc(node, fresh=True)) - offset]
+            return positions
+
+        def verify_stage(expected):
+            actual = read_positions()
+            sign = (1 if end > start else -1) * (-1 if retreat else 1)
+            actual_target = self._inc_to_um(checked_target(expected[0])) - offset
+            reverses_axis = any(sign * (actual_target - pos) < -1e-8 for pos in actual)
+            if reverses_axis or next_workflow_stage(actual, start, switch, end, window, retreat) != expected:
+                raise RuntimeError("使能后位置跨越分段边界，目标未发送，请复核位置。")
+
+        previous_target = None
+        for step_no in (1, 2):
+            self._check_motion_cancelled()
+            positions = read_positions()
+            stage = next_workflow_stage(positions, start, switch, end, window, retreat)
+            if stage is None:
+                if previous_target is not None:
+                    self._disable_drive_worker()
+                self._post("workflow_status", "已到工作起点" if retreat else "已到推进终点")
                 return
-            current = self._inc_to_um(self._read_actual_position_inc(node, fresh=True))
+            target, speed = stage
+            final = target == (start if retreat else end)
+            if target == previous_target or (step_no == 2 and not final):
+                raise RuntimeError("分段终点反馈与计划不符，已停止，请核对位置。")
+            target_inc = checked_target(target)
+            profile = fast_profile if speed == "快速" else slow_profile
+            current = " / ".join(f"{position:g}" for position in positions)
+            label = f"{speed} {current} → {target:g} µm"
             self._post("workflow_status", label)
-            self._post("log", f"{label}: {current:.2f} -> {target:.2f} um.")
-            result = self._run_test_move(
-                node=node,
-                axis=axis,
-                step_no=step_no,
-                speed_um_s=float(profile["velocity"]),
-                distance_um=target - current,
-                profile_template=profile,
-                step_timeout=timeout,
-                disable_after=step_no == len(stages),
-            )
+            self._post("log", label)
+            if paired:
+                result = self._run_linked_move(
+                    self._linked_targets_for_logical_position(self._inc_to_um(target_inc), linked),
+                    profile, timeout, linked, sync_mode="position", disable_after=final, target_label=label,
+                    before_setpoint=lambda: verify_stage(stage))
+            else:
+                self._invalidate_linked_zero("single-axis Standard Cycle")
+                result = self._run_test_move(
+                    node=node, axis=axis, step_no=step_no, speed_um_s=float(profile["velocity"]),
+                    distance_um=target - positions[0], profile_template=profile, step_timeout=timeout,
+                    disable_after=final, absolute_target_inc=target_inc, before_setpoint=lambda: verify_stage(stage))
             if result["status"] != "OK":
                 self._post("workflow_status", str(result["status"]))
-                raise RuntimeError(f"{label} failed: {result['status']}")
-
-        if retreat and bool(config["disable_after_retreat"]) and not self.stop_pending:
-            self._disable_drive_worker()
-        self._post("workflow_status", "At center" if retreat else "At target")
-        self._post("log", "Standard cycle retreat complete." if retreat else "Standard cycle approach complete.")
-
-    def _run_linked_standard_cycle_worker(
-        self,
-        config: dict[str, object],
-        retreat: bool,
-        linked: dict[str, object],
-    ) -> None:
-        center = float(config["center"])
-        direction = float(config["direction"])
-        fast_distance = float(config["fast_distance"])
-        slow_distance = float(config["slow_distance"])
-        fast_target = center + direction * fast_distance
-        final_target = fast_target + direction * slow_distance
-        limits = dict(config["limits"])
-        base_profile = dict(config["profile"])
-        timeout = float(config["timeout"])
-
-        def profile_for(speed: float, acceleration: float, quick_stop: float) -> dict[str, object]:
-            if speed > float(base_profile["max_velocity"]):
-                raise ValueError("分段速度超过配置的最大速度，已拒绝整个流程。")
-            if acceleration > float(base_profile["max_acceleration"]):
-                raise ValueError("分段加速度超过配置的最大加速度，已拒绝整个流程。")
-            if speed <= 0 or self._um_to_inc(speed) < 1:
-                raise ValueError("分段速度量化后为 0 计数/秒，已拒绝整个流程。")
-            if acceleration <= 0 or self._um_to_inc(acceleration) < 1:
-                raise ValueError("分段加速度量化后为 0 计数/秒²，已拒绝整个流程。")
-            if quick_stop <= 0 or self._um_to_inc(quick_stop) < 1:
-                raise ValueError("快速停止减速度量化后为 0 计数/秒²，已拒绝整个流程。")
-            profile = dict(base_profile)
-            profile.update(
-                velocity=speed,
-                velocity_inc=self._um_to_inc(speed),
-                max_velocity=float(base_profile["max_velocity"]),
-                max_velocity_inc=int(base_profile["max_velocity_inc"]),
-                acceleration=acceleration,
-                acceleration_inc=self._um_to_inc(acceleration),
-                max_acceleration=float(base_profile["max_acceleration"]),
-                max_acceleration_inc=int(base_profile["max_acceleration_inc"]),
-                quick_stop_decel=quick_stop,
-                quick_stop_decel_inc=self._um_to_inc(quick_stop),
-            )
-            return profile
-
-        fast_profile = profile_for(
-            float(config["fast_speed"]),
-            float(config["fast_acceleration"]),
-            PROFILE_ACCELERATION_LIMIT_UM_S2,
-        )
-        slow_profile = profile_for(
-            float(config["slow_speed"]),
-            float(base_profile["acceleration"]),
-            float(base_profile["quick_stop_decel"]),
-        )
-
-        for target in (center, fast_target, final_target):
-            self._validate_target(target, limits)
-        self._apply_linked_limits_worker(limits, linked)
-        positions = self._read_linked_logical_positions(linked, fresh=True)
-        if not retreat and any(abs(position - center) > 100.0 for position in positions.values()):
-            detail = ", ".join(f"{axis}={position:.2f}" for axis, position in positions.items())
-            raise RuntimeError(f"Linked approach must start within 100 um of center {center:.2f} um; {detail}.")
-
-        progress = direction * (sum(positions.values()) / len(positions) - center)
-        if retreat:
-            stages: list[tuple[str, float, dict[str, object]]] = []
-            if progress > fast_distance:
-                stages.append(("Linked slow retreat", fast_target, slow_profile))
-            stages.append(("Linked fast return", center, fast_profile))
-        else:
-            stages = [
-                ("Linked fast approach", fast_target, fast_profile),
-                ("Linked slow approach", final_target, slow_profile),
-            ]
-
-        for step_no, (label, target_um, profile) in enumerate(stages, 1):
-            if self.test_stop_requested.is_set():
-                self._post("workflow_status", "Stopped")
+                raise RuntimeError(f"{label}: {result['status']}")
+            # The move worker has already verified the quantized final endpoint.
+            if final:
+                self._post("workflow_status", "已到工作起点" if retreat else "已到推进终点")
                 return
-            self._post("workflow_status", label)
-            self._post("log", f"{label}: logical target {target_um:.2f} um.")
-            starts = {
-                axis: self._read_actual_position_inc(node, fresh=True)
-                for axis, node, _ in self._require_linked_axes(linked)
-            }
-            result = self._run_linked_move(
-                self._linked_targets_for_logical_position(target_um, linked),
-                profile,
-                timeout,
-                linked,
-                starts_inc=starts,
-                sync_mode="position",
-                disable_after=step_no == len(stages),
-                target_label=label,
-            )
-            if result["status"] != "OK":
-                self._post("workflow_status", str(result["status"]))
-                raise RuntimeError(f"{label} failed: {result['status']}")
-
-        self._post("workflow_status", "At center" if retreat else "At target")
-        self._post("log", "Linked retreat complete." if retreat else "Linked approach complete.")
+            previous_target = target
 
     def _run_actuator_test_worker(self, test_config: dict[str, object]) -> None:
         linked = self._linked_snapshot()
@@ -2261,6 +2398,7 @@ class XeryonControlGui(tk.Tk):
         step_timeout: float,
         disable_after: bool = True,
         absolute_target_inc: Optional[int] = None,
+        before_setpoint: Optional[Callable[[], None]] = None,
     ) -> dict[str, object]:
         profile = dict(profile_template)
         profile["velocity"] = speed_um_s
@@ -2294,6 +2432,8 @@ class XeryonControlGui(tk.Tk):
             self._prepare_profile_position(node, profile, start_inc)
 
             statusword = self._read_statusword(node, fresh=True)
+            if before_setpoint is not None:
+                before_setpoint()
             self._command_profile_position(node, target_inc)
 
             self.runtime_position_window_inc = max(1, int(profile.get("position_window_inc", self.__dict__.get("runtime_position_window_inc", 1))))
@@ -2304,7 +2444,7 @@ class XeryonControlGui(tk.Tk):
             self._post("target_moved", "0.00")
             self._post("target_remaining", f"{distance_um:.2f}")
             self._post("target_progress", "0.0%")
-            self._post("target", f"{target_um:.2f} um")
+            self._post("single_axis_target", ("目标", target_um))
 
             deadline = time.monotonic() + step_timeout
             while time.monotonic() < deadline:
@@ -2429,6 +2569,7 @@ class XeryonControlGui(tk.Tk):
         sync_mode: str = "travel",
         disable_after: bool = True,
         target_label: str = "Linked move",
+        before_setpoint: Optional[Callable[[], None]] = None,
     ) -> dict[str, object]:
         axes = self._require_linked_axes(linked)
         nodes = [node for _, node, _ in axes]
@@ -2463,6 +2604,8 @@ class XeryonControlGui(tk.Tk):
             for axis, node, _ in axes:
                 statuswords[axis] = self._read_statusword(node, fresh=True)
 
+            if before_setpoint is not None:
+                before_setpoint()
             self._command_profile_positions(
                 [(node, int(targets_inc[axis])) for axis, node, _ in axes]
             )
@@ -2719,9 +2862,10 @@ class XeryonControlGui(tk.Tk):
                 self._disable_drive_worker()
             raise
 
-    def _disable_drive_worker(self) -> dict[int, dict[str, int]]:
+    def _disable_drive_worker(self, *, only_node=None) -> dict[int, dict[str, int]]:
         try:
-            result = self._disable_nodes(list(self.nodes.values()) or [self._require_node()])
+            nodes = [only_node] if only_node is not None else list(self.nodes.values()) or [self._require_node()]
+            result = self._disable_nodes(nodes)
             self._record_motion_event("drive_disabled")
         except Exception as exc:
             self.stop_unconfirmed = True
@@ -2730,6 +2874,13 @@ class XeryonControlGui(tk.Tk):
             raise
         else:
             self.stop_unconfirmed = False
+            if isinstance(result, dict):
+                for axis, node in self.nodes.items():
+                    if node.id in result:
+                        count = int(result[node.id]["position_inc"])
+                        self.__dict__.setdefault("reference_positions", {})[axis] = count
+                        if axis == self._active_axis_name():
+                            self.last_position_inc = count
             self._post("target", "已停止 · 已核对失能与位置稳定")
             return result
         finally:
@@ -2861,27 +3012,43 @@ class XeryonControlGui(tk.Tk):
         reference = self._read_actual_position_inc(node, fresh=True) if reference_inc is None else int(reference_inc)
         # This firmware latches profile values when the drive is enabled.
         self._write_profile(node, profile)
-        self._motion_state(node, 0x00, 0x4F, 0x40)
-        self._motion_state(node, 0x06, 0x6F, 0x21)
-        self._motion_state(node, 0x07, 0x6F, 0x23)
-        set_node_operation_mode(
-            node, NodeOperationMode.PROFILE_POSITION, cancel_check=self._check_motion_cancelled)
+        self._switch_on_for_position_mode(node, reference)
         node.sdo["Position window"].raw = int(profile["position_window_inc"])
         node.sdo["Position window time"].raw = int(profile["position_window_time"])
-        self._initialize_enable_hold(node, reference)
-        self._motion_state(node, 0x0F, 0x6F, 0x27)
+        hold_inc = self._initialize_enable_hold(node, reference)
+        status = self._motion_state(node, 0x0F, 0x6F, 0x27)
+        enabled_inc = self._startup_position_sample(node, "使能刚确认", status, reference)
+        self._check_position_reference(hold_inc, enabled_inc)
+        if hold_inc != reference:
+            self._check_position_reference(reference, enabled_inc)
         wait_for_node_operation_mode(
             node, NodeOperationMode.PROFILE_POSITION, cancel_check=self._check_motion_cancelled)
         self._check_motion_cancelled()
-        self._check_position_reference(reference, self._read_actual_position_inc(node, fresh=True))
+        status = self._read_statusword(node, fresh=True)
+        enabled_inc = self._startup_position_sample(node, "位置模式反馈已确认", status, reference)
+        self._check_position_reference(hold_inc, enabled_inc)
+        if hold_inc != reference:
+            self._check_position_reference(reference, enabled_inc)
+
+    def _switch_on_for_position_mode(self, node, reference):
+        for word, mask, expected, stage in (
+            (0x00, 0x4F, 0x40, "失能已确认"),
+            (0x06, 0x6F, 0x21, "准备就绪"),
+            (0x07, 0x6F, 0x23, "Switched On 已确认"),
+        ):
+            status = self._motion_state(node, word, mask, expected)
+            self._startup_position_sample(node, stage, status, reference)
+        set_node_operation_mode(
+            node, NodeOperationMode.PROFILE_POSITION, cancel_check=self._check_motion_cancelled)
 
     def _initialize_enable_hold(self, node, reference_inc):
         # RPDO3 transmits both controlword and target. Replace its stale target
         # while operation is disabled, before transmitting the enable word.
         self._check_motion_cancelled()
-        if self._read_statusword(node, fresh=True) & 0x6F != 0x23:
+        status = self._read_statusword(node, fresh=True)
+        if status & 0x6F != 0x23:
             raise RuntimeError("启用前状态不符，已取消启用（必须处于 Switched on 状态）")
-        hold_inc = self._read_actual_position_inc(node, fresh=True)
+        hold_inc = self._startup_position_sample(node, "使能前：写入保持目标前", status, reference_inc)
         self._check_position_reference(reference_inc, hold_inc)
         self._write_target_position(node, hold_inc)
         readback_inc = int(node.sdo[0x607A].raw)
@@ -2889,9 +3056,21 @@ class XeryonControlGui(tk.Tk):
         if readback_inc != hold_inc:
             raise RuntimeError("启用前保持目标读回不一致，已取消启用")
         self._post("log", f"启用前保持当前位置：{hold_inc} 计数，目标读回已确认。")
+        return hold_inc
 
-    def _check_position_reference(self, previous_inc, current_inc):
-        # Small enable-settling motion keeps the same absolute coordinate frame.
+    def _startup_position_sample(self, node, stage, status, reference):
+        self._check_motion_cancelled()
+        position = self._read_actual_position_inc(node, fresh=True)
+        self._post("log", f"启动采样 · 节点 {node.id} · {stage} · 状态字 0x{status:04X} · "
+                   f"0x6064 = {position} 计数（{self._inc_to_um(position):.2f} µm） · "
+                   f"距启动基线 {position - reference:+d} 计数")
+        return position
+
+    @staticmethod
+    def _operation_disabled(status):
+        return (status & 0x4F) == 0x40 or (status & 0x6F) in (0x21, 0x23)
+
+    def _check_position_reference(self, previous_inc, current_inc, *, idle_node=None):
         change_inc = abs(current_inc - previous_inc)
         tolerance_inc = max(2, self._um_to_inc(POSITION_REFERENCE_TOLERANCE_UM))
         if change_inc <= tolerance_inc:
@@ -2902,19 +3081,23 @@ class XeryonControlGui(tk.Tk):
                     f"在 {POSITION_REFERENCE_TOLERANCE_UM:.0f} µm 容限内；绝对目标保持不变。",
                 )
             return
+        # An old UI sample can predate a manual adjustment. Only the idle
+        # comparison may accept this; enable checks always use live samples.
+        if idle_node is not None:
+            self._check_motion_cancelled()
+            status = self._read_statusword(idle_node, fresh=True)
+            self._post("log", f"启动采样 · 节点 {idle_node.id} · 状态切换前 · 状态字 0x{status:04X} · "
+                       f"上次 {previous_inc} 计数 → 实读 {current_inc} 计数")
+            if self._operation_disabled(status):
+                self.last_position_inc = current_inc
+                return
         self.test_stop_requested.set()
-        self.travel_range.invalidate()
-        self.__dict__.get("travel_ranges", {}).clear()
-        self._invalidate_linked_zero("coordinate jump")
-        self._post("status", None)
-        self._record_motion_event("position_reference_changed", previous_inc=previous_inc, current_inc=current_inc)
-        try:
-            self._disable_drive_worker()
-        finally:
-            self._post("target", "坐标系跳变 · 目标未发送，请重新核对位置")
-        raise RuntimeError(
-            f"运动前坐标系跳变：{self._inc_to_um(previous_inc):.2f} 变为 {self._inc_to_um(current_inc):.2f} µm。"
-            "已取消目标；请依据新读数重新设定目标，并重新确认实物零点与行程映射。"
+        self._record_motion_event("unexpected_displacement", previous_inc=previous_inc, current_inc=current_inc)
+        stopped = self._disable_drive_worker()
+        self._post("target", "检测到意外位移，已停止 · 请核对当前位置")
+        raise StartupDisplacement(
+            f"检测到意外位移：{self._inc_to_um(previous_inc):.2f} → {self._inc_to_um(current_inc):.2f} µm。"
+            "已取消本次目标并失能，请核对实际位置后再启动。", previous_inc, stopped,
         )
 
     def _motion_state(self, node, controlword, mask, expected):
@@ -2923,18 +3106,21 @@ class XeryonControlGui(tk.Tk):
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             self._check_motion_cancelled()
-            if self._read_statusword(node, fresh=True) & mask == expected:
-                return
+            status = self._read_statusword(node, fresh=True)
+            if status & mask == expected:
+                return status
             time.sleep(0.05)
         raise RuntimeError(f"Node {node.id}: state transition was not confirmed")
 
     def _check_motion_cancelled(self):
+        self._check_reference_ready()
         generation = self.__dict__.get("_motion_generation")
         if ((generation is not None and generation != self.cancel_generation)
                 or self.test_stop_requested.is_set() or self.__dict__.get("stop_unconfirmed", False)):
             raise RuntimeError("运动已取消或停止状态未确认")
 
     def _reset_motion_cancel(self):
+        self._check_reference_ready()
         if self.stop_pending or self.stop_unconfirmed:
             raise RuntimeError("停止处理中或停止状态未确认，不能开始运动")
         self.test_stop_requested.clear()
@@ -3044,12 +3230,16 @@ class XeryonControlGui(tk.Tk):
                     return
                 self.node = node
 
-                try:
-                    node.tpdo[3].wait_for_reception(timeout=0.05)
-                except Exception:
-                    pass
+                # A recently received PDO can still repeat an old position.
+                # While idle, display the result of a new 0x6064 upload each poll.
+                idle = self.active_target_inc is None
+                if not idle:
+                    try:
+                        node.tpdo[3].wait_for_reception(timeout=0.05)
+                    except Exception:
+                        pass
 
-                position_inc = self._read_actual_position_inc(node)
+                position_inc = self._read_actual_position_inc(node, fresh=idle)
                 sample_time = time.monotonic()
                 statusword = self._read_statusword(node)
                 state = str(getattr(node, "state", "-"))
@@ -3061,11 +3251,13 @@ class XeryonControlGui(tk.Tk):
                     "axis": feedback_axis,
                     "sample_time": sample_time,
                     "position_um": self._inc_to_um(position_inc),
+                    "position_inc": position_inc,
                     "statusword": statusword,
                     "state": state,
                     "mode": mode,
                 }
 
+                sample_positions = {feedback_axis: position_inc}
                 if "Actuator A" in self.nodes and "Actuator B" in self.nodes:
                     linked = {
                         "enabled": True,
@@ -3074,9 +3266,10 @@ class XeryonControlGui(tk.Tk):
                         "offsets": dict(self.linked_zero_offsets_inc),
                     }
                     pair_currents = {
-                        axis: self._read_actual_position_inc(pair_node)
+                        axis: position_inc if pair_node is node else self._read_actual_position_inc(pair_node, fresh=idle)
                         for axis, pair_node, _ in self._require_linked_axes(linked)
                     }
+                    sample_positions = pair_currents
                     self._post("linked_status", self._linked_status_payload(pair_currents, linked))
 
                 if self.active_target_inc is None and self.__dict__.get("shortcut_wait_deadline") is not None:
@@ -3143,7 +3336,7 @@ class XeryonControlGui(tk.Tk):
                         overshot = self._target_overshot(position_inc)
                         self.last_position_inc = position_inc
                         self._update_target_progress(position_inc)
-                        status.update(position_um=self._inc_to_um(position_inc), statusword=statusword,
+                        status.update(position_um=self._inc_to_um(position_inc), position_inc=position_inc, statusword=statusword,
                                       sample_time=now)
                         self._record_motion_event("live_verification", position_inc=position_inc,
                                                   statusword=statusword, stalled=software_stall)
@@ -3174,7 +3367,7 @@ class XeryonControlGui(tk.Tk):
                         target_inc = self.active_target_inc
                         disabled_result = self._disable_drive_worker()
                         self._verify_disabled_target(node, target_inc, disabled_result)
-                        self._post("target", f"已到达 · 实际位置 {reached_um:.2f} µm")
+                        self._post("single_axis_target", ("已到达", reached_um))
                         self._post("target_remaining", "0.00")
                         self._post("target_progress", "100.0%")
                         self._post("log", f"Target reached at {reached_um:.2f} um.")
@@ -3206,13 +3399,15 @@ class XeryonControlGui(tk.Tk):
                         # Terminal decisions above never wait for these additional reads.
                         self._record_controller_snapshot(node)
 
+                self.reference_positions = sample_positions
                 self._post("connection_health", True)
                 self._post("status", status)
         except Exception as exc:
             self._post("log", f"Status read failed: {exc}")
-            self._invalidate_linked_zero("communication failure")
-            self.__dict__.get("travel_ranges", {}).clear()
-            self._post("status", None)
+            if self.__dict__.get("reference_review") is None:
+                self.reference_review = dict(self.__dict__.get("reference_positions", {}))
+            self.cancel_generation = self.__dict__.get("cancel_generation", 0) + 1
+            self._post("feedback_stale", None)
             self._post("connection_health", False)
             with self.io_lock:
                 self._record_motion_event("communication_fault", error=str(exc))
@@ -3275,7 +3470,7 @@ class XeryonControlGui(tk.Tk):
             except Exception:
                 pass
             # Never substitute a previous position when feedback has expired.
-        return int(node.sdo["Position Actual Value"].raw)
+        return self._read_feedback_sdo(node, "Position Actual Value")
 
     def _read_statusword(
         self, node: BaseNode402, fresh: bool = False, fallback: Optional[int] = None
@@ -3287,7 +3482,17 @@ class XeryonControlGui(tk.Tk):
                     return int(tpdo["Statusword"].raw)
             except Exception:
                 pass
-        return int(node.sdo["Statusword"].raw)
+        return self._read_feedback_sdo(node, "Statusword")
+
+    def _read_feedback_sdo(self, node, name):
+        try:
+            return int(node.sdo[name].raw)
+        except Exception:
+            if self.__dict__.get("command_busy") and self.__dict__.get("reference_review") is None:
+                self.reference_review = dict(self.__dict__.get("reference_positions", {}))
+                self.test_stop_requested.set()
+                self._post("command_feedback_fault", node)
+            raise
 
     @staticmethod
     def _pdo_is_fresh(tpdo) -> bool:
@@ -3744,9 +3949,9 @@ class XeryonControlGui(tk.Tk):
         }
 
     def _workflow_snapshot(self) -> dict[str, object]:
-        center = self._parse_float(self.workflow_center_var, "workflow center")
-        fast_distance = self._parse_positive_float(self.workflow_fast_distance_var, "fast distance")
-        slow_distance = self._parse_positive_float(self.workflow_slow_distance_var, "slow distance")
+        start = self._parse_float(self.workflow_start_var, "工作起点")
+        switch = self._parse_float(self.workflow_switch_var, "快慢切换点")
+        end = self._parse_float(self.workflow_end_var, "推进终点")
         fast_speed = self._parse_positive_float(self.workflow_fast_speed_var, "fast speed")
         slow_speed = self._parse_positive_float(self.workflow_slow_speed_var, "slow speed")
         fast_acceleration = self._parse_positive_float(
@@ -3755,7 +3960,9 @@ class XeryonControlGui(tk.Tk):
         travel_limit = self._parse_positive_float(self.workflow_travel_limit_var, "travel limit")
         timeout = self._parse_positive_float(self.workflow_timeout_var, "workflow timeout")
 
-        if fast_distance + slow_distance > travel_limit:
+        if slow_speed > fast_speed:
+            raise ValueError("慢速段速度不能高于快速段速度。")
+        if abs(end - start) > travel_limit:
             raise ValueError("Fast distance plus slow distance must fit inside the travel limit.")
         if max(fast_speed, slow_speed) > PROFILE_VELOCITY_LIMIT_UM_S:
             raise ValueError(f"Workflow speed must not exceed {PROFILE_VELOCITY_LIMIT_UM_S:.0f} um/s.")
@@ -3764,7 +3971,8 @@ class XeryonControlGui(tk.Tk):
                 f"Fast acceleration must not exceed {PROFILE_ACCELERATION_LIMIT_UM_S2:.0f} um/s^2."
             )
 
-        limits = {"enabled": True, "min": center - travel_limit, "max": center + travel_limit}
+        offset = 0.0 if self._linked_mode_enabled() else self.position_panel.user_zero_um
+        limits = {"enabled": True, "min": offset + min(start, end), "max": offset + max(start, end)}
         custom_limits = self._limits_snapshot()
         if custom_limits["enabled"]:
             limits["min"] = max(limits["min"], custom_limits["min"])
@@ -3773,15 +3981,11 @@ class XeryonControlGui(tk.Tk):
                 raise ValueError("分段流程与自定义工作区间没有交集，已拒绝整个流程。")
 
         return {
-            "center": center,
-            "direction": 1.0 if self.workflow_positive_var.get() else -1.0,
-            "fast_distance": fast_distance,
-            "slow_distance": slow_distance,
+            "start": start, "switch": switch, "end": end,
             "fast_speed": fast_speed,
             "slow_speed": slow_speed,
             "fast_acceleration": fast_acceleration,
             "timeout": timeout,
-            "disable_after_retreat": bool(self.workflow_disable_after_retreat_var.get()),
             "limits": limits,
             "profile": self._profile_snapshot(),
         }
@@ -3932,32 +4136,55 @@ class XeryonControlGui(tk.Tk):
         elif kind == "busy":
             self.command_busy = False
             self.busy_var.set(str(payload))
+        elif kind == "review_start":
+            self.command_busy = False
+            self.busy_var.set("Idle")
+            self._show_start_confirmation(payload)
         elif kind == "connected":
             self._set_connected_state(bool(payload))
             self.encoder_combo.configure(state="disabled" if payload else "readonly")
-            # The model must remain fixed while connected; confirming that
-            # model is a separate UI action and must remain possible.
-            self.encoder_check.configure(state="normal")
         elif kind == "connection_health":
             healthy = bool(payload)
             self.connected_var.set("Connected" if healthy else "通信故障")
             self.header_connected_label.configure(
                 style="HeaderMetricConnected.TLabel" if healthy else "HeaderMetricDisconnected.TLabel"
             )
+        elif kind == "node_boot":
+            if any(node is payload for node in self.nodes.values()):
+                self.position_panel.invalidate()
+                self._invalidate_linked_zero("controller reboot")
+                self.stop_actuator_test()
+                self._show_error(self.reconnect_reason)
+        elif kind == "command_feedback_fault":
+            if any(node is payload for node in self.nodes.values()):
+                self.position_panel.received_at = None
+                self.stop_actuator_test()
+        elif kind == "feedback_stale":
+            self._dismiss_start_confirmation()
+            self.position_panel.received_at = None
+            self._cancel_shortcut_queue("通信中断，流程已取消")
         elif kind == "status":
             self._set_status(payload)
         elif kind == "settings":
             self._set_settings(payload)
         elif kind == "target":
             self.target_status_var.set(str(payload))
+        elif kind == "single_axis_target":
+            label, raw = payload
+            panel = self.position_panel
+            self.target_status_var.set(f"{label} · 用户位置 {raw-panel.user_zero_um:+.2f} µm"
+                                       if panel.user_zero_set else f"{label} · 用户零点未设置")
         elif kind == "target_coordinate":
             self.target_position_var.set(f"{float(payload):.2f}")
         elif kind == "user_zero":
-            if payload["axis"] == self.active_axis_var.get() and self.node is payload["node"]:
+            if (payload["axis"] == self.active_axis_var.get() and self.node is payload["node"]
+                    and payload["generation"] == self.cancel_generation and not self.test_stop_requested.is_set()
+                    and not (self.stop_pending or self.stop_unconfirmed or self.close_in_progress
+                             or self.disconnect_in_progress or self.reference_review is not None or self.reconnect_reason)):
                 self.position_panel.apply_user_zero(payload["raw_um"], payload["sample_time"])
-                self._log(f"当前位置已设为用户零点，编码器原值 {payload['raw_um']:.4f} µm；未发送运动或编码器写入命令。")
+                self._log(f"已刷新编码器并确认失能停稳。收回端用户零点 = {payload['raw_um']:.4f} µm。")
         elif kind == "clear_user_zero":
-            self.position_panel.clear_user_zero()
+            self.position_panel.forget_axis_zero()
         elif kind == "target_start":
             self.target_start_var.set(str(payload))
         elif kind == "target_moved":
@@ -4012,11 +4239,13 @@ class XeryonControlGui(tk.Tk):
 
     def _refresh_ui_state(self) -> None:
         self.position_panel.redraw()
+        self._update_workflow_preview()
         if not self.position_panel.is_fresh():
             self.position_var.set("-")
+        motion_locked = self.command_busy or self.start_confirmation is not None or self.active_target_inc is not None
         for combo in self.axis_combos:
-            combo.configure(state="disabled" if self.command_busy or self.active_target_inc is not None else "readonly")
-        linked_locked = (self.command_busy or self.active_target_inc is not None
+            combo.configure(state="disabled" if motion_locked else "readonly")
+        linked_locked = (motion_locked
                          or self.shortcut_active is not None or bool(self.shortcut_pending) or self.stop_pending)
         for widget in (self.linked_mode_check, self.invert_b_check, self.set_pair_zero_button):
             widget.configure(state="disabled" if linked_locked else "normal")
@@ -4141,12 +4370,136 @@ class XeryonControlGui(tk.Tk):
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _center_notice(self, window: tk.Toplevel) -> None:
+        # Let Tk measure the wrapped message and position the notice around its owner.
+        self.tk.call("tk::PlaceWindow", window, "widget", self)
+        window.lift()
+
+    def _validate_start_confirmation(self, review):
+        motion = review.motion
+        panel = self.position_panel
+        self._check_reference_ready()
+        if (self.stop_pending or self.stop_unconfirmed or self.close_in_progress or self.disconnect_in_progress
+                or motion.generation != self.cancel_generation or self.nodes.get(motion.axis) is not motion.node
+                or self._active_axis_name() != motion.axis or self.shortcut_active is not motion.step
+                or self._linked_mode_enabled()):
+            raise RuntimeError("原启动请求已失效。")
+        if (panel.user_zero_um != motion.zero
+                or panel.user_zero_set != motion.zero_set or not self.travel_range.confirmed
+                or self.travel_range.command_bounds != motion.bounds):
+            raise ValueError("零点或行程设置已改变，请重新核对。")
+        target = self._parse_float(panel.target, "目标")
+        speed = self._parse_positive_float(panel.speed, "速度")
+        if not 2 <= speed <= 500:
+            raise ValueError("速度须在 2–500 µm/s 范围内，请取消后重新设置。")
+        if self._um_to_inc(target) == self._um_to_inc(motion.target):
+            target = motion.target
+        limits = self._limits_snapshot()
+        profile = self._profile_snapshot(speed)
+        self._validate_target(target, limits)
+        if target == motion.target and limits == motion.limits and profile == motion.profile:
+            return review
+        if motion.step is not None:
+            raise ValueError("快捷步骤的设置已改变，请取消后重新选择流程。")
+        return replace(review, motion=replace(motion, target=target, limits=limits, profile=profile))
+
+    def _show_start_confirmation(self, review):
+        motion = review.motion
+        if (motion.generation != self.cancel_generation or self.close_in_progress or self.disconnect_in_progress
+                or self.nodes.get(motion.axis) is not motion.node):
+            return
+        problem = ""
+        original = review
+        try:
+            review = self._validate_start_confirmation(review)
+        except (ValueError, RuntimeError) as exc:
+            problem = str(exc)
+        motion = review.motion
+        self.start_confirmation = review
+        window = self.start_confirmation_window = tk.Toplevel(self)
+        window.title("起点位置已变化")
+        window.transient(self)
+        old = self._inc_to_um(review.previous_inc)
+        current = self._inc_to_um(review.stopped_inc)
+        target = self._inc_to_um(self._um_to_inc(motion.target))
+        relative = (f"相对用户零点：原起点 {old-motion.zero:+.2f} → 新起点 {current-motion.zero:+.2f} µm\n"
+                    f"目标 {target-motion.zero:+.2f} µm" if motion.zero_set else "用户零点未设置")
+        message = (f"{motion.axis} · {motion.label} · 已确认失能和位置稳定\n{relative}\n"
+                   f"预计位移 {target-current:+.2f} µm，速度 {motion.profile['velocity']:g} µm/s。\n"
+                   "是否从新起点继续？")
+        if motion.zero_set and review.previous_inc == self._um_to_inc(motion.zero):
+            message += "\n若推杆仍在刚标定的收回端点，请点「取消」，再点「收回端点置零」。"
+        if original is not review:
+            message = "设置已更新，请核对以下运动。\n" + message
+        ttk.Label(window, text=message, padding=16, wraplength=460).pack()
+        absolute = f"编码器绝对位置 {current:.2f} µm"
+        if not motion.zero_set:
+            absolute += f" · 编码器目标 {target:.2f} µm"
+        ttk.Label(window, text=absolute, style="Muted.TLabel").pack(anchor="e", padx=12, pady=(0, 6))
+        self._log(message.replace("\n", " "))
+        self.target_status_var.set("位置已变化 · 等待确认")
+        buttons = ttk.Frame(window, padding=(12, 0, 12, 12))
+        buttons.pack()
+        self.continue_button = ttk.Button(buttons, text="继续", command=lambda: self._continue_start(review))
+        self.continue_button.pack(side="left", padx=4)
+        ttk.Button(buttons, text="取消", command=self._dismiss_start_confirmation).pack(side="left", padx=4)
+        window.protocol("WM_DELETE_WINDOW", self._dismiss_start_confirmation)
+        if problem:
+            self._block_start_confirmation(problem)
+        self._center_notice(window)
+
+    def _block_start_confirmation(self, problem):
+        self.continue_button.state(["disabled"])
+        ttk.Label(self.start_confirmation_window, text=problem, wraplength=440).pack(
+            before=self.continue_button.master, padx=12, pady=(0, 10))
+        self._log(problem)
+
+    def _dismiss_start_confirmation(self):
+        review = self.__dict__.get("start_confirmation")
+        if review is None:
+            return
+        self._close_start_confirmation()
+        if review.motion.step is not None:
+            self._cancel_shortcut_queue("已取消从新起点继续")
+        self.target_status_var.set("已取消运动")
+
+    def _close_start_confirmation(self):
+        self.start_confirmation = None
+        self.start_confirmation_window.destroy()
+        self.start_confirmation_window = None
+
+    def _continue_start(self, review):
+        if self.start_confirmation is not review or self.continue_button.instate(["disabled"]):
+            return
+        try:
+            updated = self._validate_start_confirmation(review)
+        except (ValueError, RuntimeError) as exc:
+            self._block_start_confirmation(str(exc))
+            return
+        if updated is not review:
+            self._close_start_confirmation()
+            self._show_start_confirmation(review)
+            return
+        self._close_start_confirmation()
+        try:
+            self._reset_motion_cancel()
+            if self._dispatch_panel_move(review.motion, review.stopped_inc):
+                return
+        except (ValueError, RuntimeError) as exc:
+            self._show_error(str(exc))
+        if review.motion.step is not None:
+            self._cancel_shortcut_queue("重新启动失败，已取消快捷流程")
+        self.target_status_var.set("运动未启动")
+
     def _show_error(self, message: str) -> None:
         # A modal dialog grabs all inputs and makes the main STOP unreachable.
+        if self.close_in_progress:
+            self._log(message)
+            return
         window = self.__dict__.get("error_window")
         if window is not None and window.winfo_exists():
             self.error_message.set(message)
-            window.lift()
+            self._center_notice(window)
             return
         self.error_window = window = tk.Toplevel(self)
         window.title("控制器提示（STOP / Esc 仍可用）")
@@ -4155,40 +4508,64 @@ class XeryonControlGui(tk.Tk):
         ttk.Label(window, textvariable=self.error_message, wraplength=520, padding=20).pack()
         ttk.Button(window, text="停止 STOP", command=self.stop_actuator_test).pack(pady=6)
         ttk.Button(window, text="关闭提示", command=window.destroy).pack(pady=6)
+        self._center_notice(window)
 
     def _on_close(self) -> None:
         if self.close_in_progress:
+            if self.close_notice is not None:
+                self._center_notice(self.close_notice)
             return
         self.close_in_progress = True
+        self.close_cleanup_started = self.command_busy and self.busy_var.get() == "Disconnect"
+        self.disconnect_in_progress = False  # Closing takes over any scheduled disconnect.
+        self.close_deadline = time.monotonic() + max(5.0, 2.0 + 1.5 * len(self.nodes))
+        window = self.__dict__.get("error_window")
+        if window is not None and window.winfo_exists():
+            window.destroy()
         self._cancel_shortcut_queue("快捷流程已关闭")
         self.test_stop_requested.set()
-        if not self.nodes and not self.command_busy and not self.__dict__.get("status_busy", False):
-            self.destroy()
+        self._finish_close()
+
+    def _show_close_notice(self) -> None:
+        if self.close_notice is not None:
             return
-        if self.nodes:
-            self._run_stop_command("Close", self._stop_and_disable_worker)
-        self.after(100, self._finish_close)
+        self.close_notice = window = tk.Toplevel(self)
+        window.title("等待控制器退出")
+        window.transient(self)
+        ttk.Label(window, wraplength=440, padding=16, text=(
+            "设备停止确认或连接清理尚未完成。请确认所有连接轴的驱动器电源已关闭、"
+            "推杆已停止，再手动退出。")).pack()
+        ttk.Button(window, text="已确认断电并停止，退出软件",
+                   command=self.destroy).pack(padx=12, pady=(0, 8))
+        ttk.Button(window, text="隐藏提示", command=window.withdraw).pack(pady=(0, 10))
+        window.protocol("WM_DELETE_WINDOW", window.withdraw)
+        self._center_notice(window)
 
     def _finish_close(self) -> None:
         if not self.close_in_progress:
             return
-        if self.stop_pending or self.command_busy or self.__dict__.get("status_busy", False):
-            self.after(100, self._finish_close)
+        if self.nodes and not self.close_stop_requested and not self.close_cleanup_started:
+            self.close_stop_requested = True
+            self._run_stop_command("Close", self._stop_and_disable_worker)
+
+        busy = self.stop_pending or self.command_busy or self.__dict__.get("status_busy", False)
+        if not busy and (self.stop_unconfirmed or (self.close_stop_requested and not self.stop_verified)):
+            self._show_close_notice()
             return
-        if self.stop_unconfirmed:
-            self.close_in_progress = False
-            self._show_error("停止状态未确认，窗口未关闭。请关闭驱动器电源后再退出。")
-            return
-        if not self.close_cleanup_started:
+        if not busy:
+            if self.close_cleanup_started or self.network is None:
+                self.destroy()
+                return
             self.close_cleanup_started = True
             try:
-                self._run_command("Disconnect", self._disconnect_worker)
+                self._run_command("Disconnect", lambda: self._disconnect_worker(verify_stop=False))
             except Exception as exc:
-                self.close_in_progress = False
-                self._show_error(str(exc))
-            self.after(100, self._finish_close)
-            return
-        self.destroy()
+                self._log(f"退出时提交断连失败：{exc}")
+                self._show_close_notice()
+                return
+        if time.monotonic() >= self.close_deadline:
+            self._show_close_notice()
+        self.after(100, self._finish_close)
 
 
 def main() -> None:
@@ -4198,14 +4575,14 @@ def main() -> None:
         app.update_idletasks()
         assert Path(app.eds_path_var.get()).is_file()
         workflow = app._workflow_snapshot()
-        assert workflow["center"] == 50.0
-        assert workflow["fast_distance"] + workflow["slow_distance"] == 12_950.0
-        assert workflow["center"] + workflow["fast_distance"] + workflow["slow_distance"] == 13_000.0
-        assert app.node_id_var.get() == "33"
+        assert workflow["start"] == 50.0
+        assert workflow["switch"] == 10050.0
+        assert workflow["end"] == 13000.0
+        assert app.node_id_var.get() == str(NODE_ID)
         assert app.default_limit_var.get() is True
         assert workflow["fast_speed"] == 50.0
         assert workflow["fast_acceleration"] == 500.0
-        assert workflow["limits"] == {"enabled": True, "min": -14_950.0, "max": 15_050.0}
+        assert workflow["limits"] == {"enabled": True, "min": 50.0, "max": 13000.0}
         assert workflow["profile"]["position_window"] == 5.0
         assert workflow["profile"]["position_window_time"] == 200
         assert workflow["profile"]["following_error_window"] == 20.0
@@ -4247,8 +4624,14 @@ def main() -> None:
         try:
             app._write_profile = lambda node, profile: activation_order.append("profile")
             app._read_actual_position_inc = lambda node, **kwargs: 0
-            app._motion_state = lambda node, word, mask, expected: activation_order.append(word)
-            app._initialize_enable_hold = lambda node, reference: activation_order.append("hold verified")
+            def simulate_state(node, word, mask, expected):
+                activation_order.append(word)
+                return expected
+            app._motion_state = simulate_state
+            def simulate_hold(node, reference):
+                activation_order.append("hold verified")
+                return reference
+            app._initialize_enable_hold = simulate_hold
             globals()["set_node_operation_mode"] = (
                 lambda node, mode, **kwargs: activation_order.append(mode)
             )
@@ -4259,7 +4642,9 @@ def main() -> None:
                 "ProfileNode",
                 (),
                 {
+                    "id": 32,
                     "sdo": {
+                        "Statusword": type("RawValue", (), {"raw": 0x27})(),
                         "Position window": type("RawValue", (), {"raw": 0})(),
                         "Position window time": type("RawValue", (), {"raw": 0})(),
                     }

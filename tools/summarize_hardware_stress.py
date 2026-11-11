@@ -89,7 +89,7 @@ def summarize(audit):
             reached=[r for r in rows if r['event']=='target_reached']
             stops=[r for r in rows if r['event']=='stop_verified']
             failures=[r for r in rows if r['event'] in ('stop','communication_fault','communication_stop',
-                                                       'disable_failed','position_reference_changed')]
+                                                       'disable_failed','position_reference_changed','unexpected_displacement')]
             if failures:
                 case['trace_failures']=failures
             if stops:

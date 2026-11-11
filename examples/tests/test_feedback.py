@@ -55,6 +55,19 @@ def make_app(position=20, timestamp=None):
 
 
 class FeedbackTests(unittest.TestCase):
+    def test_idle_manual_motion_publishes_live_counts_even_with_recent_unchanged_pdo(self):
+        app, node, pdo = make_app()
+        app.active_target_inc = None
+        node.sdo["Statusword"].raw = pdo["Statusword"].raw = 0x1250
+        for count in (13000, 13200):
+            pdo.timestamp = time.time()
+            node.sdo["Position Actual Value"].raw = count
+            app._status_worker()
+            status = [call.args[1] for call in app._post.call_args_list if call.args[0] == "status"][-1]
+            self.assertEqual((status["position_inc"], status["position_um"]), (count, float(count)))
+        self.assertEqual(pdo["Position Actual Value"].raw, 20)
+        app._write_controlword.assert_not_called()
+
     def test_stale_pdo_is_not_position_or_status(self):
         app, node, _ = make_app(position=60, timestamp=time.time()-60)
         node.sdo["Statusword"].raw = 0x631

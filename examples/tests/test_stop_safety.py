@@ -132,6 +132,7 @@ class StopTests(unittest.TestCase):
                 a.test_stop_requested.set()
                 worker = threading.Thread(target=a._stop_runner, args=("STOP", Mock()))
                 worker.start()
+            return expected
         a._motion_state = Mock(side_effect=request_stop)
         with a.io_lock:
             with self.assertRaisesRegex(RuntimeError, "运动已取消"):
@@ -322,14 +323,14 @@ class StopTests(unittest.TestCase):
         a._prepare_profile_position = Mock()
         a._disable_drive_worker = Mock()
         a._command_profile_position = Mock()
-        with self.assertRaisesRegex(RuntimeError,"坐标"):
+        with self.assertRaisesRegex(RuntimeError,"意外位移"):
             a._move_absolute_worker(-100,{}, {})
         a._command_profile_position.assert_not_called()
         a._disable_drive_worker.assert_called_once()
-        a.travel_range.invalidate.assert_called_once()
+        a.travel_range.invalidate.assert_not_called()
         self.assertTrue(a.test_stop_requested.is_set())
 
-    def test_stale_ui_coordinate_cancels_before_enable(self):
+    def test_stale_ui_coordinate_while_enabled_cancels_before_enable(self):
         a = app()
         a.inc_per_mm = 1000
         a.travel_range = Mock()
@@ -339,11 +340,33 @@ class StopTests(unittest.TestCase):
         a._invalidate_linked_zero = Mock()
         a._validate_target = Mock()
         a._read_actual_position_inc = Mock(return_value=-24748)
+        a._read_statusword = Mock(return_value=0x27)
         a._prepare_profile_position = Mock()
         a._disable_drive_worker = Mock()
-        with self.assertRaisesRegex(RuntimeError,"坐标"):
+        with self.assertRaisesRegex(RuntimeError,"意外位移"):
             a._move_absolute_worker(-100,{}, {})
         a._prepare_profile_position.assert_not_called()
+
+    def test_disabled_manual_adjustment_uses_live_start_without_moving_zero(self):
+        a = app()
+        a.inc_per_mm = 1000
+        a.travel_range = Mock()
+        a.active_target_inc = None
+        a.last_position_inc = 15000
+        a._require_node = Mock(return_value=a.node)
+        a._invalidate_linked_zero = Mock()
+        a._validate_target = Mock()
+        a._read_statusword = Mock(return_value=0x1250)
+        a._read_actual_position_inc = Mock(return_value=15200)
+        a._prepare_profile_position = Mock()
+        a._start_motion_trace = Mock()
+        a._command_profile_position = Mock()
+        a._move_absolute_worker(16000, {"velocity": 5, "acceleration": 50}, {})
+        a._read_statusword.assert_called_once_with(a.node, fresh=True)
+        a._prepare_profile_position.assert_called_once_with(a.node, {"velocity": 5, "acceleration": 50}, 15200)
+        a._command_profile_position.assert_called_once_with(a.node, 16000)
+        a.travel_range.invalidate.assert_not_called()
+        self.assertFalse(a.test_stop_requested.is_set())
 
     def test_small_enable_settling_keeps_absolute_target(self):
         a = app()

@@ -45,7 +45,7 @@ def validate(folder, require_hardware=False, minimum_count=500):
         check(profile['acceleration'] == 50, f'{name}: acceleration changed')
         check(profile.get('jerk') == 500, f'{name}: finite jerk missing or changed')
         check(not any(r['event'] in ('stop','communication_fault','communication_stop','disable_failed',
-                                    'position_reference_changed') for r in rows),
+                                    'position_reference_changed', 'unexpected_displacement') for r in rows),
               f'{name}: protective termination occurred')
         refreshes = [r for r in rows if r['event'] == 'same_target_refresh']
         check(not refreshes, f'{name}: repeated target refresh is not an uninterrupted single command')

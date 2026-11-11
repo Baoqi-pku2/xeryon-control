@@ -142,7 +142,6 @@ def run(output, dwell=30.0):
         node = SimulatedNode()
         app.nodes = {"Actuator A": node}
         app.node = node
-        app.encoder_verified_var.set(True)
         origin_um = app._inc_to_um(node.position)
         app.position_panel.apply_user_zero(origin_um, time.monotonic())
         app.position_panel.apply_travel()  # Exercise the previously failing precheck.

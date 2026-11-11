@@ -69,7 +69,6 @@ class SequenceDwellTests(unittest.TestCase):
         self.node = NS(id=33)
         self.app.node = self.node
         self.app.nodes = {"Actuator A": self.node}
-        self.app.encoder_verified_var.set(True)
         self.app.position_panel.apply_user_zero(-196 * 1.0079, time.monotonic())
         self.app._safe_start = Mock(return_value=True)
         self.app._show_error = Mock()

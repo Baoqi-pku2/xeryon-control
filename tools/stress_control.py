@@ -129,7 +129,6 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
     app.reset_on_connect_var.set(False)
     app.node_b_enabled_var.set(False)
     app.encoder_var.set('1MU')
-    app.encoder_verified_var.set(True)
     app.acceleration_var.set(str(acceleration))
     highest_speed = max(s['speed_um_s'] for b in plan['batches'] for s in b['steps'])
     app.max_velocity_var.set(str(max(float(app.max_velocity_var.get()), highest_speed)))

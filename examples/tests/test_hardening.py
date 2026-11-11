@@ -28,12 +28,19 @@ def make_app():
     app.default_limit_enabled = True
     app.travel_range = TravelRange()
     app.travel_ranges = {}
+    app.node_identities = {}
     app.position_panel = NS(user_zero_um=0.0, user_zero_set=False)
     app.linked_zero_offsets_inc = {}
     app.io_lock = threading.RLock()
     app.controlword_lock = threading.Lock()
     app.test_stop_requested = threading.Event()
     app.stop_pending = False
+    app.stop_verified = False
+    app.close_in_progress = False
+    app.close_stop_requested = False
+    app.close_cleanup_started = False
+    app.close_notice = None
+    app.busy_var = var("Idle")
     app.stop_unconfirmed = False
     app.cancel_generation = 0
     app.command_busy = False
@@ -70,6 +77,24 @@ def linked_app():
 
 
 class HardeningTests(unittest.TestCase):
+    def test_canable_preferred_over_bluetooth_and_refresh_keeps_explicit_choice(self):
+        ports = [NS(device="COM9", vid=None, pid=None),
+                 NS(device="COM4", vid=0xAD50, pid=0x60C4)]
+        with patch("control_gui.list_ports.comports", return_value=ports):
+            names, preferred = Gui._serial_port_choices()
+            self.assertCountEqual(names, ["COM4", "COM9"])
+            self.assertEqual(preferred, "COM4")
+            app = make_app()
+            app.node = None
+            app.channel_combos = []
+            app.channel_var = Mock()
+            app.channel_var.get.return_value = "COM9"
+            app.refresh_ports()
+            app.channel_var.set.assert_not_called()
+            app.channel_var.get.return_value = "COM3"
+            app.refresh_ports()
+            app.channel_var.set.assert_called_once_with("COM4")
+
     def test_default_limit_requires_coordinate_reference(self):
         app = make_app()
         with self.assertRaisesRegex(ValueError, "置零"):
@@ -109,13 +134,15 @@ class HardeningTests(unittest.TestCase):
                                       starts_inc={"Actuator A": 0, "Actuator B": 0})
         self.assertNotEqual(result["status"], "OK")
 
-    def test_coordinate_jump_invalidates_linked_zero(self):
+    def test_unexpected_displacement_stops_both_axes_and_preserves_pair_reference(self):
         app = linked_app()
         app.travel_range = Mock()
         app._disable_drive_worker = Mock()
         with self.assertRaises(RuntimeError):
             app._check_position_reference(1000, 20000)
-        self.assertEqual(app.linked_zero_offsets_inc, {})
+        self.assertEqual(app.linked_zero_offsets_inc, {"Actuator A": 0, "Actuator B": 0})
+        app._disable_drive_worker.assert_called_once()
+        app.travel_range.invalidate.assert_not_called()
 
     def test_reconnect_verifies_disable_before_clearing_unknown_stop(self):
         app = make_app()
@@ -125,7 +152,7 @@ class HardeningTests(unittest.TestCase):
         app.node = None
         sdo = type("Sdo", (dict,), {"RESPONSE_TIMEOUT": 1.0, "MAX_RETRIES": 1, "PAUSE_BEFORE_SEND": 0.0})(
             {0x6041: NS(raw=0x27), 0x1802: {1: NS(raw=0x380 + 32), 3: NS(raw=0)}})
-        node = NS(id=33, sdo=sdo, nmt=NS(state="OPERATIONAL"), setup_402_state_machine=Mock(),
+        node = NS(id=33, sdo=sdo, nmt=NS(state="OPERATIONAL", add_heartbeat_callback=Mock()), setup_402_state_machine=Mock(),
                   tpdo_pointers={}, tpdo_values={}, rpdo_pointers={})
         network = NS(add_node=Mock(), disconnect=Mock())
         eds_path = str(Path("eds/xeryon_xla_5_eds.eds").resolve())
@@ -217,7 +244,7 @@ class HardeningTests(unittest.TestCase):
         app._apply_limits_worker = Mock()
         app._disable_drive_worker = Mock()
         app._read_actual_position_inc = Mock(side_effect=[50, 10050, 13000])
-        config = dict(center=50.0, direction=1.0, fast_distance=10000.0, slow_distance=2950.0,
+        config = dict(start=50.0, switch=10050.0, end=13000.0,
                       fast_speed=500.0, slow_speed=5.0, fast_acceleration=500.0, timeout=10,
                       disable_after_retreat=True,
                       limits={"enabled": False, "min": 50.0, "max": 13000.0},
@@ -234,17 +261,70 @@ class HardeningTests(unittest.TestCase):
             app._run_standard_cycle_worker(config, retreat=False)
         app._apply_limits_worker.assert_not_called()
         config["fast_acceleration"] = 500.0
-        app._read_actual_position_inc = Mock(return_value=50)
+        app._read_actual_position_inc = Mock(side_effect=[50, 10050])
         app._run_test_move = Mock(return_value={"status": "OK"})
         app._run_standard_cycle_worker(config, retreat=False)
         self.assertEqual(app._run_test_move.call_count, 2)
         targets = [call.kwargs["distance_um"] for call in app._run_test_move.call_args_list]
-        self.assertEqual(targets, [10000.0, 12950.0])
+        self.assertEqual(targets, [10000.0, 2950.0])
         app._disable_drive_worker = Mock()
         config["slow_speed"] = 0.1
         with self.assertRaisesRegex(ValueError, "0 计数"):
             app._run_standard_cycle_worker(config, retreat=False)
         app._disable_drive_worker.assert_called_once()
+
+    def test_resume_from_11000_uses_user_zero_and_only_slow_absolute_target(self):
+        app = make_app()
+        app.node = NS(id=33)
+        app.nodes = {"Actuator A": app.node}
+        app.position_panel.user_zero_set = True
+        app.position_panel.user_zero_um = 8000
+        app.travel_range.confirm(38000, 50, "Actuator A")
+        app._read_actual_position_inc = Mock(return_value=19000)
+        app._run_test_move = Mock(return_value={"status": "OK"})
+        config = dict(start=50, switch=10050, end=13000, fast_speed=50, slow_speed=5,
+                      fast_acceleration=500, timeout=900, limits=dict(enabled=True, min=8050, max=21000),
+                      profile=dict(max_velocity=300, max_velocity_inc=300, max_acceleration=500,
+                                   max_acceleration_inc=500, acceleration=50, quick_stop_decel=500,
+                                   position_window_inc=5))
+        app._run_standard_cycle_worker_impl(config, False)
+        call = app._run_test_move.call_args.kwargs
+        self.assertEqual((call["absolute_target_inc"], call["speed_um_s"], call["distance_um"]), (21000, 5, 2000))
+        call["before_setpoint"]()
+        app._read_actual_position_inc.return_value = 18000
+        with self.assertRaisesRegex(RuntimeError, "跨越分段"):
+            call["before_setpoint"]()
+        app._read_actual_position_inc.return_value = 21000
+        app._run_test_move.reset_mock()
+        app._run_standard_cycle_worker_impl(config, False)
+        app._run_test_move.assert_not_called()
+
+    def test_reference_review_checks_identity_and_preserves_original_zero(self):
+        app = make_app()
+        app.nodes = {"Actuator A": NS(id=33)}
+        app.reference_review = {"Actuator A": 19000}
+        app.reconnect_reason = ""
+        app.node_identities = {33: (1, 2, 3, 44)}
+        app.position_panel.user_zero_um = 8000
+        app._safe_start = lambda label, worker: worker()
+        with patch("control_gui.lss_read_identity_via_sdo", return_value=(1, 2, 3, 44)), \
+             patch("control_gui.verify_disabled", side_effect=[
+                 {"position_inc": 19200, "statusword": 0x40},
+                 {"position_inc": 19001, "statusword": 0x40},
+             ]):
+            with self.assertRaisesRegex(RuntimeError, "零点仍待复核"):
+                app.review_reference()
+            self.assertEqual(app.reconnect_reason, "")
+            self.assertEqual(app.reference_review, {"Actuator A": 19000})
+            app.review_reference()
+        self.assertIsNone(app.reference_review)
+        self.assertEqual(app.position_panel.user_zero_um, 8000)
+        app.reference_review = {"Actuator A": 19000}
+        with patch("control_gui.lss_read_identity_via_sdo", return_value=(1, 2, 3, 45)):
+            with self.assertRaisesRegex(RuntimeError, "身份"):
+                app.review_reference()
+        with self.assertRaisesRegex(RuntimeError, "重新标定"):
+            app._reset_motion_cancel()
 
     def test_requested_and_actual_mode_confirmation_are_separate(self):
         node = NS(id=33, sdo={"Mode of operation": NS(raw=0), 0x6061: NS(raw=0)})
@@ -266,7 +346,7 @@ class HardeningTests(unittest.TestCase):
 
     def test_profile_position_confirms_actual_mode_after_enable(self):
         app = make_app()
-        app._initialize_enable_hold = Mock()
+        app._initialize_enable_hold = Mock(return_value=0)
         node = NS(id=33, sdo={
             "Mode of operation": NS(raw=0), 0x6061: NS(raw=0),
             "Position window": NS(raw=0), "Position window time": NS(raw=0),
@@ -278,6 +358,8 @@ class HardeningTests(unittest.TestCase):
             order.append(controlword)
             if controlword == 0x0F:
                 node.sdo[0x6061].raw = NodeOperationMode.PROFILE_POSITION.value
+            node.sdo["Statusword"] = NS(raw=expected)
+            return expected
         app._motion_state = Mock(side_effect=enable_changes_actual_mode)
         with patch("control_gui.wait_for_node_operation_mode",
                    side_effect=lambda n, m, **kwargs: utils.wait_for_node_operation_mode(n, m, timeout=0.01, **kwargs)):
@@ -286,7 +368,7 @@ class HardeningTests(unittest.TestCase):
 
     def test_wrong_actual_mode_after_enable_blocks_target(self):
         app = make_app()
-        app._initialize_enable_hold = Mock()
+        app._initialize_enable_hold = Mock(return_value=0)
         node = NS(id=33, sdo={
             "Mode of operation": NS(raw=0), 0x6061: NS(raw=0),
             "Position window": NS(raw=0), "Position window time": NS(raw=0),
@@ -302,6 +384,7 @@ class HardeningTests(unittest.TestCase):
         def enable_selects_wrong_mode(node, controlword, mask, expected):
             if controlword == 0x0F:
                 node.sdo[0x6061].raw = NodeOperationMode.HOMING.value
+            return expected
         app._motion_state = Mock(side_effect=enable_selects_wrong_mode)
         with patch("control_gui.wait_for_node_operation_mode",
                    side_effect=lambda n, m, **kwargs: utils.wait_for_node_operation_mode(n, m, timeout=0.01, **kwargs)):
@@ -488,30 +571,57 @@ class HardeningTests(unittest.TestCase):
         app.nodes = {"Actuator A": NS(id=33)}
         app._cancel_shortcut_queue = Mock()
         app._run_stop_command = Mock()
+        app._show_close_notice = Mock(side_effect=lambda: setattr(app, "close_notice", Mock()))
+        app._center_notice = Mock()
         app.destroy = Mock()
         app._on_close()
         app._run_stop_command.assert_called_once()
         app.destroy.assert_not_called()
-        app.close_in_progress = True
-        app.stop_unconfirmed = True
-        app._finish_close()
+        app._on_close()
+        app._center_notice.assert_called_once_with(app.close_notice)
+        app._run_stop_command.assert_called_once()
         app.destroy.assert_not_called()
-        app._show_error.assert_called_once()
+        app._show_close_notice.assert_called_once()
+        app._show_error.assert_not_called()
 
     def test_close_destroys_only_after_background_cleanup_finishes(self):
         app = make_app()
         app.close_in_progress = True
-        app.close_cleanup_started = False
+        app.close_stop_requested = True
+        app.stop_verified = True
+        app.close_deadline = float("inf")
+        app.node = NS(id=33)
+        app.nodes = {"A": app.node}
+        app.network = Mock()
+        network = app.network
+        app._disable_drive_worker = Mock()
         app.stop_unconfirmed = False
         app._run_command = Mock()
         app.destroy = Mock()
         app._finish_close()
-        app._run_command.assert_called_once_with("Disconnect", app._disconnect_worker)
+        label, cleanup = app._run_command.call_args.args
+        self.assertEqual(label, "Disconnect")
+        cleanup()
+        network.disconnect.assert_called_once()
+        app._disable_drive_worker.assert_not_called()
         app.destroy.assert_not_called()
         app.after.assert_called_with(100, app._finish_close)
         app.close_cleanup_started = True
         app._finish_close()
         app.destroy.assert_called_once()
+
+    def test_hung_transport_offers_exit_and_keeps_motion_blocked(self):
+        app = make_app()
+        app.nodes = {"A": NS(id=33)}
+        app.stop_pending = app.close_in_progress = app.close_stop_requested = True
+        app.close_deadline = 0
+        app._show_close_notice = Mock()
+        app.destroy = Mock()
+        app._finish_close()
+        app._show_close_notice.assert_called_once()
+        app.destroy.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "不能提交"):
+            app._run_command("Move absolute", Mock())
 
     def test_busy_disconnect_waits_then_runs_cleanup(self):
         app = make_app()
@@ -532,6 +642,7 @@ class HardeningTests(unittest.TestCase):
     def test_invalid_device_readback_retains_safe_values(self):
         app = make_app()
         values = {
+            "Position Actual Value": -29348, 0x6063: -30000,
             "Profile velocity": 100, "Profile acceleration": 100, "Max profile velocity": 1000,
             "Max acceleration": 1000, "Quick stop deceleration": 3023700,
             "Position window": 0xFFFFFFFF, "Position window time": 0,
@@ -542,6 +653,7 @@ class HardeningTests(unittest.TestCase):
         node.sdo["Software position limit"] = values["Software position limit"]
         app._require_node = Mock(return_value=node)
         app._read_device_worker()
+        app._post.assert_any_call("log", "位置读回：0x6064 实际位置 = -29348 计数，0x6063 内部位置 = -30000")
         payload = app._post.call_args.args[1]
         self.assertNotIn("quick_stop_decel", payload)
         self.assertNotIn("position_window", payload)
@@ -674,14 +786,14 @@ class HardeningTests(unittest.TestCase):
         app.limit_enabled_var = var(True)
         app.min_limit_var = var("1000")
         app.max_limit_var = var("12000")
-        names = ("workflow_center_var", "workflow_fast_distance_var", "workflow_slow_distance_var",
+        names = ("workflow_start_var", "workflow_switch_var", "workflow_end_var",
                  "workflow_fast_speed_var", "workflow_slow_speed_var", "workflow_fast_acceleration_var",
-                 "workflow_travel_limit_var", "workflow_timeout_var", "workflow_positive_var",
-                 "workflow_disable_after_retreat_var", "velocity_var", "acceleration_var",
+                 "workflow_travel_limit_var", "workflow_timeout_var",
+                 "velocity_var", "acceleration_var",
                  "max_velocity_var", "max_acceleration_var", "quick_stop_decel_var",
                  "position_window_var", "position_window_time_var", "following_error_window_var",
                  "following_error_timeout_var")
-        values = (50, 10000, 2950, 50, 5, 500, 15000, 900, True, True,
+        values = (50, 10050, 13000, 50, 5, 500, 15000, 900,
                   5, 50, 300, 500, 500, 5, 200, 20, 1000)
         for name, value in zip(names, values):
             setattr(app, name, var(str(value)))
@@ -743,14 +855,18 @@ class HardeningTests(unittest.TestCase):
                                  {"position_window_inc": 2}, 1, link,
                                  starts_inc={"Actuator A": 29500, "Actuator B": 0})
 
-    def test_communication_failure_invalidates_linked_zero_and_mappings(self):
+    def test_communication_failure_suspends_linked_zero_and_mappings(self):
         app = linked_app()
         app.status_busy = True
         app._read_actual_position_inc = Mock(side_effect=RuntimeError("lost link"))
         app._disable_nodes = Mock()
+        app.reference_positions = {"Actuator A": 87, "Actuator B": 92}
         app._status_worker()
-        self.assertEqual(app.linked_zero_offsets_inc, {})
-        self.assertEqual(app.travel_ranges, {})
+        self.assertEqual(app.reference_review, app.reference_positions)
+        self.assertEqual(len(app.travel_ranges), 2)
+        self.assertEqual(len(app.linked_zero_offsets_inc), 2)
+        with self.assertRaisesRegex(RuntimeError, "待复核"):
+            app._reset_motion_cancel()
 
     def test_test_move_passes_original_start_into_prepare(self):
         app = make_app()

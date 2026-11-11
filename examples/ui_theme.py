@@ -1,4 +1,5 @@
 """Local presentation components. No device access or motion state changes."""
+import sys
 import tkinter as tk
 from math import sqrt
 from tkinter import ttk
@@ -11,6 +12,85 @@ MUTED = "#626B7B"
 LINE = "#E6E4ED"
 BLUE = "#2477F5"
 FONT = "Microsoft YaHei UI"
+
+MIN_CLIENT_WIDTH, MIN_CLIENT_HEIGHT = 1100, 760
+
+
+def _desktop_area(root):
+    """Work rectangle and total frame size, in the window's coordinate units."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class MonitorInfo(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
+                        ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        monitor_at = user32.MonitorFromPoint
+        monitor_at.argtypes = (wintypes.POINT, wintypes.DWORD)
+        monitor_at.restype = wintypes.HANDLE
+        info = MonitorInfo()
+        info.size = ctypes.sizeof(info)
+        monitor = monitor_at(wintypes.POINT(*root.winfo_pointerxy()), 2)  # nearest monitor
+        if user32.GetMonitorInfoW(wintypes.HANDLE(monitor), ctypes.byref(info)):
+            work = info.work
+            frame = wintypes.RECT()
+            # Standard resizable, decorated Tk toplevel (WS_OVERLAPPEDWINDOW).
+            if user32.AdjustWindowRectEx(ctypes.byref(frame), 0x00CF0000, False, 0):
+                return (work.left, work.top, work.right, work.bottom,
+                        frame.right - frame.left, frame.bottom - frame.top)
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight(), 16, 40
+
+
+def configure_startup_window(root):
+    left, top, right, bottom, frame_w, frame_h = _desktop_area(root)
+    available_w = max(1, right - left - frame_w)
+    available_h = max(1, bottom - top - frame_h)
+    width = min(available_w, 1600, max(MIN_CLIENT_WIDTH, round(available_w * 0.90)))
+    height = min(available_h, 1000, max(MIN_CLIENT_HEIGHT, round(available_h * 0.92)))
+    minimum = min(width, MIN_CLIENT_WIDTH), min(height, MIN_CLIENT_HEIGHT)
+    root.minsize(*minimum)
+    x = left + (available_w - width) // 2
+    y = top + (available_h - height) // 2
+    # Keep the '+' prefix for absolute coordinates on monitors left of/above primary.
+    root.geometry(f"{width}x{height}+{x}+{y}")
+    return minimum != (MIN_CLIENT_WIDTH, MIN_CLIENT_HEIGHT)
+
+
+def scrollable_work_area(parent, min_width, min_height):
+    """Keep the notebook reachable on small displays while the header stays fixed."""
+    viewport = ttk.Frame(parent)
+    viewport.rowconfigure(0, weight=1)
+    viewport.columnconfigure(0, weight=1)
+    canvas = tk.Canvas(viewport, borderwidth=0, highlightthickness=0, background=BG)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    horizontal = ttk.Scrollbar(viewport, orient="horizontal", command=canvas.xview)
+    vertical = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+    canvas.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
+    content = ttk.Frame(canvas, style="App.TFrame")
+    item = canvas.create_window(0, 0, anchor="nw", window=content)
+
+    def fit(event):
+        width, height = event.width, event.height
+        needs_x = width < min_width
+        needs_y = height - (horizontal.winfo_reqheight() if needs_x else 0) < min_height
+        if needs_y:
+            vertical.grid(row=0, column=1, sticky="ns")
+            width -= vertical.winfo_reqwidth()
+        else:
+            vertical.grid_remove()
+        if width < min_width:
+            horizontal.grid(row=1, column=0, sticky="ew")
+            height -= horizontal.winfo_reqheight()
+        else:
+            horizontal.grid_remove()
+        width, height = max(min_width, width), max(min_height, height)
+        canvas.itemconfigure(item, width=width, height=height)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    viewport.bind("<Configure>", fit)
+    return viewport, content
 
 
 def rounded_button(style, root, name, normal, hover, disabled=INPUT):

@@ -39,8 +39,8 @@ from common.parameters import EncoderRes, CANBitrate
 #  - EncoderRes.ENC_RES_100NAN
 ENC_RES = EncoderRes.ENC_RES_1MU
 
-# Current actuator Node ID is 33; the factory default is 32.
-NODE_ID = 33
+# Factory-default CANopen address for the primary actuator.
+NODE_ID = 32
 
 # Interface (str): Interface type (e.g., "slcan", "socketcan").
 CAN_INTERFACE = "slcan"

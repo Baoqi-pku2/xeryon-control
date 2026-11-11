@@ -19,7 +19,6 @@ class ShortcutTests(unittest.TestCase):
         self.node = SimpleNamespace(id=33)
         self.app.node = self.node
         self.app.nodes = {"Actuator A": self.node}
-        self.app.encoder_verified_var.set(True)
         self.app.shortcut_dwell_var.set("0")  # Legacy queue tests exercise immediate continuation.
         self.app.position_panel.apply_user_zero(100, time.monotonic())
         self.app._safe_start = Mock()
@@ -43,7 +42,7 @@ class ShortcutTests(unittest.TestCase):
                 (2, "到达dura上", 7000.0, 20.0),
                 (3, "进入脑区", 12000.0, 5.0),
                 (4, "撤出脑区", 7000.0, 5.0),
-                (5, "撤到零点", 50.0, 300.0),
+                (5, "撤到工作起点", 50.0, 300.0),
                 (6, "清洗下电极", 8000.0, 50.0),
                 (7, "清洗撤电极", 50.0, 300.0),
             ),
