@@ -9,15 +9,16 @@ import json
 import os
 from pathlib import Path
 import random
-import sys
 import time
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'examples'))
-import control_gui
-import shortcut_presets
-from verify_sequence_flow import SimulatedNode
+from xeryon_control.ui import main_window as control_gui
+from xeryon_control.domain import shortcut_presets
+if __package__:
+    from .simulated_node import SimulatedNode
+else:  # Direct script invocation from the repository.
+    from simulated_node import SimulatedNode
 
 
 def write_progress_report(path, report):
@@ -136,10 +137,10 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
     report = {'hardware_motion': hardware, 'simulation_dwell_s': None if hardware else 0,
               'seed': plan['seed'], 'planned_count': plan['count'], 'acceleration_um_s2': acceleration,
               'reference_count': reference_count,
-              'source_sha256': hashlib.sha256((ROOT/'examples/control_gui.py').read_bytes()).hexdigest(),
+              'source_sha256': hashlib.sha256((ROOT/'src/xeryon_control/ui/main_window.py').read_bytes()).hexdigest(),
               'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'completed': [], 'errors': [], 'start_clicks': 0, 'submitted': [], 'result': 'RUNNING'}
-    source_paths = sorted((ROOT/'examples').glob('*.py')) + sorted((ROOT/'examples/common').glob('*.py'))
+    source_paths = sorted((ROOT/'src/xeryon_control').rglob('*.py'))
     report['source_manifest'] = {str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
     started, last_tick, last_save = time.monotonic(), time.monotonic(), 0
     verified_stops = {}
@@ -337,7 +338,10 @@ if __name__ == '__main__':
     parser.add_argument('--reference-count',type=int)
     args = parser.parse_args()
     if args.plan_file:
-        from plan_random1000 import generate
+        if __package__:
+            from .plan_random1000 import generate
+        else:
+            from plan_random1000 import generate
         plan=json.loads(args.plan_file.read_text(encoding='utf-8'))
         if plan != generate(plan.get('seed'), 1000):
             parser.error('Acceptance plan must exactly match the frozen 1000-case generator')
@@ -359,7 +363,7 @@ if __name__ == '__main__':
         if args.hardware:
             result = run(plan, args.output, True, args.acceleration, reference_count)
         else:
-            with patch('control_gui.setup_network', side_effect=AssertionError('CAN forbidden in simulation')):
+            with patch('xeryon_control.ui.main_window.setup_network', side_effect=AssertionError('CAN forbidden in simulation')):
                 result = run(plan, args.output, False, args.acceleration, reference_count)
         print(json.dumps({k: result.get(k) for k in ('result','completed_count','elapsed_s','errors','shutdown_completed')}, ensure_ascii=True))
         raise SystemExit(0 if result['result'] == 'PASSED' else 1)

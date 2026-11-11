@@ -24,14 +24,13 @@
 
 ## 运行
 
-Windows 建议使用 Python 3.13（含 Tcl/Tk）。首次运行双击 `run_gui.cmd`，脚本会创建本地环境、安装依赖并打开界面；打开界面不会自动连接设备。
+Windows 上双击 `run_gui.cmd` 启动。项目使用 uv，首次运行会下载 `.python-version` 指定的 Python（含 Tcl/Tk），按 `uv.lock` 创建 `.venv` 并安装依赖。打开界面后可手动连接设备。
 
-也可在项目根目录执行：
+脚本优先使用项目内的 `.uv\bin\uv.exe`，也可直接使用电脑已有的 uv（本项目验证版本为 0.10.12）。新电脑可从 [uv 官方发布页](https://github.com/astral-sh/uv/releases) 下载对应 Windows 架构的压缩包，将 `uv.exe` 放到上述项目目录。解释器、下载缓存与临时文件保存在项目的 `.uv` 下。单独准备环境或从终端启动：
 
 ```powershell
-py -3.13 -m venv .xeryon-venv
-.\.xeryon-venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.xeryon-venv\Scripts\python.exe examples/control_gui.py
+.\project_uv.cmd sync --locked
+.\run_gui.cmd
 ```
 
 本版采用紧凑双栏，顶部标题、导航、状态、STOP 同排；默认 1320×820，最小 1100×760。主页面和高级设置不做纵向滚动，日志与结果表保留内部滚动。
@@ -43,20 +42,19 @@ py -3.13 -m venv .xeryon-venv
 从项目根目录运行，不需要 CAN 设备：
 
 ```powershell
-.\.xeryon-venv\Scripts\python.exe -m unittest discover -s examples/tests -p "test_*.py" -v
-.\.xeryon-venv\Scripts\python.exe tools/verify_ui_layout.py --output layout-check.json
-.\.xeryon-venv\Scripts\python.exe tools/verify_ui_responsiveness.py --output responsiveness-check.json
+.\project_uv.cmd run --locked python -m unittest discover -s tests -p "test_*.py" -v
+.\project_uv.cmd run --locked python tools/verify_ui_layout.py --output layout-check.json
+.\project_uv.cmd run --locked python tools/verify_ui_responsiveness.py --output responsiveness-check.json
 ```
 
 GUI 测试需要可用的桌面和 Tk。GitHub Actions 配置为 Windows 上执行离线单元测试，不执行硬件诊断或运动。手动脚本 `examples/tests/verify_communication.py` 不属于这组离线测试。
 
 ## Windows 打包
 
-完成环境安装后双击 `build_portable.cmd`，输出为 `release/portable/XeryonControl.exe`。也可执行：
+双击 `build_portable.cmd` 即可打包。脚本会自动同步 `build` 依赖组，输出为 `release/portable/XeryonControl.exe`。也可执行：
 
 ```powershell
-.\.xeryon-venv\Scripts\python.exe -m pip install -r requirements-build.txt
-.\.xeryon-venv\Scripts\python.exe -m PyInstaller --noconfirm XeryonControl.spec
+.\project_uv.cmd run --locked --group build python -m PyInstaller --noconfirm XeryonControl.spec
 ```
 
 第二种方式输出到 `dist/XeryonControl.exe`。本地路径、Python 发行版和打包依赖可能影响二进制哈希；重新打包后需重新检查，不能沿用历史 EXE 的验证结论。
@@ -67,13 +65,13 @@ GUI 测试需要可用的桌面和 Tk。GitHub Actions 配置为 Windows 上执�
 
 | 路径 | 内容 |
 | --- | --- |
-| `examples/control_gui.py` | GUI 与控制流程 |
-| `examples/position_panel.py`, `examples/ui_theme.py` | 紧凑控制面板与界面样式 |
-| `examples/common/` | CANopen 参数与底层工具 |
-| `examples/tests/test_*.py` | 离线回归测试 |
+| `src/xeryon_control/ui/main_window.py` | GUI 与控制流程 |
+| `src/xeryon_control/ui/position_panel.py`, `src/xeryon_control/ui/theme.py` | 紧凑控制面板与界面样式 |
+| `src/xeryon_control/hardware/` | CANopen 参数与底层工具 |
+| `tests/test_*.py` | 离线回归测试 |
 | `tools/verify_ui_*.py` | 离线布局和响应检查 |
 | `tools/diagnose_*.py`, `tools/run_hardware_validation.py` | 设备诊断脚本，运行前必须审阅实际动作和参数 |
-| `eds/` | 厂家设备描述 |
+| `src/xeryon_control/resources/eds/` | 厂家设备描述 |
 
 `configuration.py`、`homing.py`、节点配置和硬件诊断脚本可能改变设备状态或参数，不是快速入门命令。调试从离线测试开始，涉及真实运动的修改须单独安排实机验证。
 

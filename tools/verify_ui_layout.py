@@ -1,20 +1,18 @@
 """Offline responsive Tk checks; no real CAN network can be created."""
 import argparse
 import json
-import sys
 import tkinter as tk
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "examples"))
-from control_gui import XeryonControlGui
+from xeryon_control.ui.main_window import XeryonControlGui
 
 
 def check(output):
     result = {"hardware_connected": False, "layouts": [], "checks": []}
     errors = []
-    with patch("control_gui.setup_network", side_effect=AssertionError("Offline check attempted CAN")):
+    with patch("xeryon_control.ui.main_window.setup_network", side_effect=AssertionError("Offline check attempted CAN")):
         app = XeryonControlGui()
         # This audit injects state explicitly; live polling belongs to the separate
         # event-loop responsiveness check and would keep update() processing timers.

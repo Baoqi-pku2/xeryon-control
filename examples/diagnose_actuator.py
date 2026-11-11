@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import argparse
 import time
-from pathlib import Path
 
 from canopen import BaseNode402, Network
 
-from settings import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE, DEFAULT_SDO_TIMEOUT, INC_PER_MM, NODE_ID
+from xeryon_control.config import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE, DEFAULT_SDO_TIMEOUT, EDS_PATH, INC_PER_MM, NODE_ID
 
 
 def main() -> None:
@@ -19,7 +18,7 @@ def main() -> None:
     parser.add_argument("--watch", type=float, default=0.0, metavar="SECONDS")
     args = parser.parse_args()
 
-    eds = Path(__file__).resolve().parents[1] / "eds" / "xeryon_xla_5_eds.eds"
+    eds = EDS_PATH
     network = Network()
     try:
         network.connect(interface=CAN_INTERFACE, channel=args.channel, bitrate=args.bitrate)

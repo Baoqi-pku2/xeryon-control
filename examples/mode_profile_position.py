@@ -21,13 +21,13 @@ import time
 
 from canopen import BaseNode402
 
-from common.parameters import NodeOperationMode, NodeState
-from common.utils import (
+from xeryon_control.hardware.parameters import NodeOperationMode, NodeState
+from xeryon_control.hardware.canopen_io import (
     set_node_operation_mode, wait_for_node_operation_mode, wait_for_statusword_flags, setup_network, BIT,
     set_node_state, homing, configure_node, set_target_position, set_controlword, get_actual_position, error_handler
 )
-from settings import NODE_ID, INC_PER_MM
-from stop_safety import verify_disabled
+from xeryon_control.config import NODE_ID, INC_PER_MM
+from xeryon_control.hardware.stop import verify_disabled
 
 # ----- Logging setup -----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

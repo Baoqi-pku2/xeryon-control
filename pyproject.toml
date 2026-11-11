@@ -1,0 +1,23 @@
+[project]
+name = "xeryon-control"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "canopen~=2.3.0",
+    "python-can>=4.5.0",
+    "pyserial>=3.5",
+]
+
+[dependency-groups]
+build = ["pyinstaller==6.21.0"]
+
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = false
+
+[tool.setuptools.package-data]
+xeryon_control = ["resources/eds/*"]

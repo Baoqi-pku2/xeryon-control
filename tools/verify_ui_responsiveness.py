@@ -1,13 +1,11 @@
 """Offline Tk queue stress check. No node or network is created."""
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from control_gui import XeryonControlGui
+from xeryon_control.ui.main_window import XeryonControlGui
 
 
 def measure():
@@ -45,7 +43,7 @@ def measure():
     app.after(150, stop)
     app.after(200, finish_when_drained)
     # Any accidental transport creation is an immediate verification failure.
-    with patch("control_gui.setup_network", side_effect=AssertionError("Offline check attempted CAN")):
+    with patch("xeryon_control.ui.main_window.setup_network", side_effect=AssertionError("Offline check attempted CAN")):
         app.mainloop()
     result["passed"] = (result["stop_called"] and result["remaining_events"] == 0
                         and result["heartbeat_max_gap_ms"] < 250

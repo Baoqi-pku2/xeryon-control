@@ -40,25 +40,17 @@ Exit Codes:
 © 2025 Xeryon – All rights reserved.
 For demonstration purposes only. See README for disclaimer.
 """
-import os
 import sys
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
 
 import logging
 import time
 
 from canopen import Network
 
-try:
-    from common.utils import lss_check_configured_nodes, lss_scan_and_configure_nodes, lss_unconfigure_all_nodes
-    from common.parameters import LSS_RESET_DELAY
-    from settings import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE
-except ImportError:
-    from examples.common.utils import lss_check_configured_nodes, lss_scan_and_configure_nodes, lss_unconfigure_all_nodes
-    from examples.common.parameters import LSS_RESET_DELAY
-    from examples.settings import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE
+from xeryon_control.hardware.canopen_io import lss_check_configured_nodes, lss_scan_and_configure_nodes, lss_unconfigure_all_nodes
+from xeryon_control.hardware.parameters import LSS_RESET_DELAY
+from xeryon_control.config import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE
 
 # ---- Configuration ----------------------------------------------------------------
 START_NODE_ID = 32              # The starting Node ID

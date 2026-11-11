@@ -3,6 +3,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
+from xeryon_control.config import EDS_PATH
 
 import canopen
 
@@ -21,7 +22,7 @@ def read_snapshot(channel, output, extended=False):
               "node_id": 33, "motion_or_parameter_writes": False, "objects": {}}
     try:
         network.connect(interface="slcan", channel=channel, bitrate=125000)
-        node = canopen.RemoteNode(33, str(Path(__file__).resolve().parents[1]/"eds/xeryon_xla_5_eds.eds"))
+        node = canopen.RemoteNode(33, EDS_PATH)
         network.add_node(node)
         node.sdo.RESPONSE_TIMEOUT = 0.3
         node.sdo.MAX_RETRIES = 1

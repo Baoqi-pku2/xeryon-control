@@ -4,8 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from control_gui import XeryonControlGui
-from repeatability import run_repeatability
+from xeryon_control.ui.main_window import XeryonControlGui
+from xeryon_control.application.repeatability import run_repeatability
 
 
 def main():

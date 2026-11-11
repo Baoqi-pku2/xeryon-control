@@ -18,8 +18,8 @@ import time
 
 from canopen import BaseNode402
 
-from common.utils import setup_network, homing, configure_node, error_handler
-from settings import NODE_ID
+from xeryon_control.hardware.canopen_io import setup_network, homing, configure_node, error_handler
+from xeryon_control.config import NODE_ID
 
 # ----- Logging setup -----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

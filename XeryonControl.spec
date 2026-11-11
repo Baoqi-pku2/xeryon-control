@@ -1,19 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
-import sys
 
 project_root = Path(SPECPATH)
-conda_bin = Path(sys.base_prefix) / "Library" / "bin"
-conda_dlls = [(str(path), ".") for path in conda_bin.glob("*.dll")] if conda_bin.exists() else []
 
 a = Analysis(
-    [str(project_root / "examples" / "control_gui.py")],
-    pathex=[str(project_root / "examples")],
-    binaries=conda_dlls,
+    [str(project_root / "src/xeryon_control/__main__.py")],
+    pathex=[str(project_root / "src")],
     datas=[
-        (str(project_root / "eds" / "xeryon_xla_5_eds.eds"), "eds"),
-        (str(project_root / "eds" / "xeryon_xla_5_eds_docu.txt"), "eds"),
+        (str(project_root / "src/xeryon_control/resources/eds"), "xeryon_control/resources/eds"),
     ],
     hiddenimports=["can.interfaces.slcan"],
     hookspath=[],

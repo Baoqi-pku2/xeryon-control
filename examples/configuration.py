@@ -22,12 +22,12 @@ import sys
 
 from canopen import BaseNode402
 
-from common.parameters import (
+from xeryon_control.hardware.parameters import (
     NodeOperationMode, LEDMask, RESTORE_ALL_DEFAULT_PARAMETERS, DEFAULT_STATUS_LOGGING,
     SAVE_ALL_PARAMETERS, EncoderRes
 )
-from common.utils import setup_network, BIT, configure_node, reset_node, error_handler
-from settings import INC_PER_MM, NODE_ID, ENC_RES
+from xeryon_control.hardware.canopen_io import setup_network, BIT, configure_node, reset_node, error_handler
+from xeryon_control.config import INC_PER_MM, NODE_ID, ENC_RES
 
 # ----- Logging setup -----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

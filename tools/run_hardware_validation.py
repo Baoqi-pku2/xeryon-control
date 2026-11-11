@@ -7,15 +7,13 @@ import argparse
 import hashlib
 import json
 import os
-import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "examples"))
-from control_gui import XeryonControlGui
-import control_gui
-import shortcut_presets
+from xeryon_control.ui.main_window import XeryonControlGui
+from xeryon_control.ui import main_window as control_gui
+from xeryon_control.domain import shortcut_presets
 
 
 def apply_verified_shutdown(report, shutdown_completed, verified_stops):
@@ -63,7 +61,7 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
     report = {"phase": phase, "reference_count": reference_count, "speed_um_s": speed,
               "acceleration_um_s2": acceleration, "hardware_motion": True,
               "errors": [], "steps": [], "start_clicks": 0}
-    report["source_sha256"] = hashlib.sha256((ROOT / "examples/control_gui.py").read_bytes()).hexdigest()
+    report["source_sha256"] = hashlib.sha256((ROOT / "src/xeryon_control/ui/main_window.py").read_bytes()).hexdigest()
     report['harness_sha256'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     verified_stops = {}
     original_record = app._record_motion_event

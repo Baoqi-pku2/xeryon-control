@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 import hashlib
 import json
 from pathlib import Path
+from xeryon_control.config import EDS_PATH
 import time
 
 import canopen
@@ -85,7 +86,7 @@ def run(output):
     network.subscribe(0x5A1, receive)
     try:
         network.connect(interface="slcan", channel="COM3", bitrate=125000)
-        node = network.add_node(33, str(ROOT / "eds/xeryon_xla_5_eds.eds"))
+        node = network.add_node(33, EDS_PATH)
         node.sdo.RESPONSE_TIMEOUT = 0.4
         node.sdo.MAX_RETRIES = 1
         # Suppress the library's automatic outbound abort on a timeout.

@@ -18,22 +18,15 @@ purposes during development, production testing, or troubleshooting.
 © 2025 Xeryon – All rights reserved.
 For demonstration purposes only. See README for disclaimer.
 """
-import os
 import sys
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
 
 import logging
 
 from canopen import BaseNode402, nmt
 
-try:
-    from settings import NODE_ID
-    from common.utils import setup_network
-except ImportError:
-    from examples.settings import NODE_ID
-    from examples.common.utils import setup_network
+from xeryon_control.config import NODE_ID
+from xeryon_control.hardware.canopen_io import setup_network
 
 # ----- Logging setup -----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

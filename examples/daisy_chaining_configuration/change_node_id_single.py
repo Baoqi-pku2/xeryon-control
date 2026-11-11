@@ -27,22 +27,15 @@ Exit Codes:
 For demonstration purposes only. See README for disclaimer.
 """
 
-import os
 import sys
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
 
 import logging
 
 from canopen import Network
 
-try:
-    from common.utils import lss_configure_single_node_id
-    from settings import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE, EDS_PATH
-except ImportError:
-    from examples.common.utils import lss_configure_single_node_id
-    from examples.settings import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE, EDS_PATH
+from xeryon_control.hardware.canopen_io import lss_configure_single_node_id
+from xeryon_control.config import CAN_BITRATE, CAN_CHANNEL, CAN_INTERFACE, EDS_PATH
 
 # ---- Configuration ----------------------------------------------------------------
 NODE_ID     = 32                 # Current (known) Node ID on the bus

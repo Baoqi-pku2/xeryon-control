@@ -1,6 +1,6 @@
 # 协作快照验证 · 2026-11-06
 
-在独立导出目录中使用 Windows / Python 3.13 及 `requirements-dev.txt` 对应的已安装依赖运行：
+在独立导出目录中使用 Windows / Python 3.13 和该快照当时锁定的依赖运行：
 
 ```text
 python -m unittest discover -s examples/tests -p "test_*.py" -v
