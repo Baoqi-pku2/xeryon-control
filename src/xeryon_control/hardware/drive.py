@@ -9,9 +9,9 @@ def operation_disabled(status):
 
 def check_halted_profile_mode(node, halt_enabled):
     if int(node.sdo[0x6040].raw) != halt_enabled:
-        raise RuntimeError("Halt 控制字未确认，未设置零点。")
+        raise RuntimeError("Halt 控制字未确认，采样已取消。")
     if int(node.sdo[0x6061].raw) != NodeOperationMode.PROFILE_POSITION.value:
-        raise RuntimeError("位置模式未确认，未设置零点。")
+        raise RuntimeError("位置模式未确认，采样已取消。")
 
 
 def command_profile_positions(commands, write_controlword, write_target, wait_ack):

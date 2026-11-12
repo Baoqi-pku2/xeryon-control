@@ -4,16 +4,18 @@ Real CAN is opened only with --hardware. Simulation is explicitly labelled and
 uses accelerated ideal motion and zero dwell; it is not hardware validation.
 """
 import argparse
+from xeryon_control.ui.main_window import create_desktop
 import hashlib
 import json
 import os
 from pathlib import Path
 import random
+import sys
 import time
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-from xeryon_control.ui import main_window as control_gui
+from xeryon_control.application import session as control_gui
 from xeryon_control.domain import shortcut_presets
 if __package__:
     from .simulated_node import SimulatedNode
@@ -117,10 +119,13 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
     if not hardware:
         control_gui.POLL_INTERVAL_MS = 30
         control_gui.STATUS_POLL_REST_SECONDS = 0
-    app = control_gui.XeryonControlGui()
-    app.title(app.title() + (' · 实机压力测试 / STOP 可中止' if hardware else ' · 模拟压力测试'))
-    if not hardware:
-        app.withdraw()
+    qt, window = create_desktop()
+    app = window.session
+    window.setWindowTitle(window.windowTitle() + (' · 实机压力测试 / STOP 可中止' if hardware else ' · 模拟压力测试'))
+    if hardware:
+        window.show()
+    else:
+        window.hide()
         origin = (app._um_to_inc(app._inc_to_um(reference_count)+plan['initial_fixture_user_um'])
                   if 'initial_fixture_user_um' in plan else -93)
         node = SimulatedNode(origin=origin)
@@ -137,7 +142,7 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
     report = {'hardware_motion': hardware, 'simulation_dwell_s': None if hardware else 0,
               'seed': plan['seed'], 'planned_count': plan['count'], 'acceleration_um_s2': acceleration,
               'reference_count': reference_count,
-              'source_sha256': hashlib.sha256((ROOT/'src/xeryon_control/ui/main_window.py').read_bytes()).hexdigest(),
+              'source_sha256': hashlib.sha256((ROOT/'src/xeryon_control/application/session.py').read_bytes()).hexdigest(),
               'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'completed': [], 'errors': [], 'start_clicks': 0, 'submitted': [], 'result': 'RUNNING'}
     source_paths = sorted((ROOT/'src/xeryon_control').rglob('*.py'))
@@ -177,7 +182,7 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
         finished = True
         report['result'] = result
         save()
-        (output/'ui.log').write_text(app.log_text.get('1.0', 'end'), encoding='utf-8')
+        (output/'ui.log').write_text(window.advanced.log.toPlainText(), encoding='utf-8')
         app._on_close()
 
     original_error, original_done, original_start = app._show_error, app._handle_shortcut_done, app._start_shortcut_step
@@ -189,9 +194,9 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
     app._show_error = error
 
     def callback_error(kind, value, tb):
-        error(f'Tk callback exception: {kind.__name__}: {value}')
+        error(f'GUI callback exception: {kind.__name__}: {value}')
         app.stop_actuator_test()
-    app.report_callback_exception = callback_error
+    original_exception_hook = sys.excepthook
 
     def complete(step):
         if step['index'] != len(report['completed'])+1:
@@ -234,11 +239,11 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
                             for i, step in enumerate(batch['steps'], 1))
             control_gui.SHORTCUT_PRESETS = shortcut_presets.SHORTCUT_PRESETS = presets
             for i, name, target, speed in presets:
-                app.position_panel.shortcut_buttons[i].configure(text=f'{name} / {target:g} / {speed:g}')
-                app.position_panel.shortcut_buttons[i].invoke()
+                window.panel.presets[i].set_step(name, f'{target:g}', speed)
+                window.panel.presets[i].click()
         app.position_panel.redraw()
         report['start_clicks'] += 1
-        app.position_panel.start_button.invoke()
+        window.panel.start.click()
         state = 'moving'
         emit('batch_started', batch_id=batch['id'], kind=batch['kind'])
 
@@ -299,12 +304,16 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
             report['errors'].append('Overall stress deadline exceeded')
             finish('TIMEOUT')
             return
-        app.after(50, tick)
+        app.schedule(50, tick)
 
     if hardware:
-        app.after(100, app.connect_device)
-    app.after(200, tick)
-    app.mainloop()
+        app.schedule(100, app.connect_device)
+    app.schedule(200, tick)
+    sys.excepthook = callback_error
+    try:
+        qt.exec()
+    finally:
+        sys.excepthook = original_exception_hook
     if not finished:
         report['result'] = 'CLOSED_BY_USER'
     report['shutdown_completed'] = app.node is None and not app.stop_unconfirmed
@@ -363,7 +372,7 @@ if __name__ == '__main__':
         if args.hardware:
             result = run(plan, args.output, True, args.acceleration, reference_count)
         else:
-            with patch('xeryon_control.ui.main_window.setup_network', side_effect=AssertionError('CAN forbidden in simulation')):
+            with patch('xeryon_control.application.session.setup_network', side_effect=AssertionError('CAN forbidden in simulation')):
                 result = run(plan, args.output, False, args.acceleration, reference_count)
         print(json.dumps({k: result.get(k) for k in ('result','completed_count','elapsed_s','errors','shutdown_completed')}, ensure_ascii=True))
         raise SystemExit(0 if result['result'] == 'PASSED' else 1)

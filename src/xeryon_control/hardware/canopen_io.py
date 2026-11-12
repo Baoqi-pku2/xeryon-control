@@ -79,7 +79,6 @@ def setup_network(
         raise FileNotFoundError(f"EDS file not found: {eds_path}")
 
     log.info(f"EDS path resolved: {eds_path}")
-    log.info(f"Object Dictionary documentation: {os.path.dirname(eds_path)}/xeryon_xla_5_eds_docu.txt")
 
     network = Network()
     try:

@@ -32,7 +32,7 @@ for speed,outcomes in sorted(r['speed_outcomes'].items(),key=lambda item:float(i
     lines.append(f"| {speed} | {outcomes.get('PASSED',0)} | {outcomes.get('FAILED',0)} | {outcomes.get('NOT_RUN',0)} |")
 lines += ['', '| 控制源码 | 通过 | 失败 |', '|---|---:|---:|']
 modules = package['modules']
-final_source = (modules.get('xeryon_control.ui.main_window') or modules['control_gui'])['source_sha256']
+final_source = (modules.get('xeryon_control.application.session') or modules.get('xeryon_control.ui.main_window') or modules['control_gui'])['source_sha256']
 for source,outcomes in r['source_outcomes'].items():
     label='最终 .32' if source==final_source else '此前 .31'
     lines.append(f"| {label} / {source[:12]} | {outcomes.get('PASSED',0)} | {outcomes.get('FAILED',0)} |")

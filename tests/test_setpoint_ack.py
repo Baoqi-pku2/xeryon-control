@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 
 
 class SetpointAcknowledgementTests(unittest.TestCase):
@@ -36,7 +36,7 @@ class SetpointAcknowledgementTests(unittest.TestCase):
     def test_missing_acceptance_does_not_report_success(self):
         app = self.app()
         app._read_statusword = Mock(return_value=0x27)
-        with patch('xeryon_control.ui.main_window.SETPOINT_ACK_TIMEOUT_SECONDS', 0), self.assertRaisesRegex(RuntimeError, '握手超时'):
+        with patch('xeryon_control.application.session.SETPOINT_ACK_TIMEOUT_SECONDS', 0), self.assertRaisesRegex(RuntimeError, '握手超时'):
             app._command_profile_position(NS(id=33), 123)
 
     def test_fault_or_disabled_drive_rejected(self):
@@ -44,7 +44,7 @@ class SetpointAcknowledgementTests(unittest.TestCase):
             with self.subTest(status=status):
                 app = self.app()
                 app._read_statusword = Mock(return_value=status)
-                with self.assertRaisesRegex(RuntimeError, '故障或未使能'):
+                with self.assertRaisesRegex(RuntimeError, '故障或未开启'):
                     app._command_profile_position(NS(id=33), 123)
                 self.assertEqual(app._write_controlword.call_count, 2)
 

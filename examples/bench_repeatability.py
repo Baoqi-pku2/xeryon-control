@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from xeryon_control.ui.main_window import XeryonControlGui
+from xeryon_control.application.session import ControllerSession
 from xeryon_control.application.repeatability import run_repeatability
 
 
@@ -19,8 +19,7 @@ def main():
     parser.add_argument("--encoder-label-verified", action="store_true")
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "results")
     args = parser.parse_args()
-    app = XeryonControlGui()
-    app.withdraw()
+    app = ControllerSession()
     report = None
     try:
         app.channel_var.set(args.channel)
@@ -39,7 +38,6 @@ def main():
         print(json.dumps(report, indent=2), flush=True)
     finally:
         app._disconnect_worker()
-        app.destroy()
     return 0 if report and report["status"] == "COMPLETED" else 1
 
 

@@ -1,12 +1,13 @@
-"""Safety regressions: synthetic transport and real Tk, never opens a CAN bus."""
+"""Safety regressions: synthetic transport and real Qt widgets, never opens a CAN bus."""
 import tempfile
 import threading
 import unittest
+from tests.qt_support import create_console
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 from tests.test_hardening import make_app, linked_app, var
 from tests.test_stop_safety import node as fake_node
 from tests.test_repeatability import FakeApp
@@ -14,7 +15,7 @@ from xeryon_control.application.repeatability import run_repeatability
 from xeryon_control.hardware.stop import verify_disabled
 
 
-class Release28SafetyTests(unittest.TestCase):
+class ControllerLifecycleTests(unittest.TestCase):
     def test_device_limits_round_inward_for_single_and_inverted_axes(self):
         app = linked_app()
         for node in app.nodes.values():
@@ -91,7 +92,7 @@ class Release28SafetyTests(unittest.TestCase):
         app.pair_tolerance_um = 20
         for value in ("", "-", "nan", "0", "-1", "inf"):
             app.pair_tolerance_var = var(value)
-            app._sync_pair_tolerance()  # Editing must not throw a Tk callback error.
+            app._sync_pair_tolerance()  # Editing must not throw a GUI callback error.
             with self.assertRaises(ValueError):
                 app._linked_snapshot()
         app.pair_tolerance_var = var("12.5")
@@ -104,10 +105,10 @@ class Release28SafetyTests(unittest.TestCase):
         app.nodes = {}
         app.command_busy = True
         app._cancel_shortcut_queue = Mock()
-        app.destroy = Mock()
+        app.finish_exit = Mock()
         app._on_close()
-        app.destroy.assert_not_called()
-        app.after.assert_called_with(100, app._finish_close)
+        app.finish_exit.assert_not_called()
+        app.schedule.assert_called_with(100, app._finish_close)
 
     def test_close_and_disconnect_block_new_user_commands(self):
         for flag in ("close_in_progress", "disconnect_in_progress"):
@@ -127,7 +128,7 @@ class Release28SafetyTests(unittest.TestCase):
         with patch("xeryon_control.application.feedback.threading.Thread") as thread:
             app._poll_status()
             thread.assert_not_called()
-        app.after.assert_called_once()
+        app.schedule.assert_called_once()
 
     def test_single_axis_stop_releases_io_without_duplicate_cleanup(self):
         app = make_app()
@@ -181,30 +182,28 @@ class Release28SafetyTests(unittest.TestCase):
         app._invalidate_linked_zero = Mock()
         app._run_test_move = Mock(return_value={"status": "OK"})
         app.test_stop_requested.wait = Mock(return_value=True)
-        with patch("xeryon_control.ui.main_window.time.sleep") as sleep:
+        with patch("xeryon_control.application.session.time.sleep") as sleep:
             app._run_actuator_test_worker({"speeds": [5], "distances": [10],
                 "settle_time": 60, "step_timeout": 10, "return_after": True, "profile": {}})
         sleep.assert_not_called()
         app._run_test_move.assert_called_once()
 
 
-class Release28UiTests(unittest.TestCase):
+class ControllerUiEventTests(unittest.TestCase):
     def setUp(self):
-        self.app = Gui()
-        self.app.withdraw()
-        self.app.update_idletasks()
+        self.window = create_console()
+        self.app = self.window.session
         self.app._show_error = Mock()
 
     def tearDown(self):
-        for timer in self.app.tk.call("after", "info"):
-            self.app.after_cancel(timer)
-        self.app.destroy()
+        self.window.finish_exit()
+        self.window.deleteLater()
 
     def test_bad_ui_event_does_not_kill_queue_pump(self):
         self.app.command_busy = True
         self.app._post("status", {"axis": "Actuator A", "position_um": "bad"})
         self.app._post("busy", "Idle")
-        with patch.object(self.app, "after") as after:
+        with patch.object(self.app, "schedule") as after:
             self.app._drain_ui_queue()
             after.assert_called_once()
             # The error window/log may consume this tick's 10 ms budget.
@@ -216,7 +215,7 @@ class Release28UiTests(unittest.TestCase):
     def test_queue_backlog_yields_to_stop_button(self):
         for index in range(1000):
             self.app._post("target", str(index))
-        with patch.object(self.app, "after") as after:
+        with patch.object(self.app, "schedule") as after:
             self.app._drain_ui_queue()
         self.assertGreater(self.app.ui_queue.qsize(), 0)
         self.assertLess(self.app.ui_queue.qsize(), 1000)
@@ -224,7 +223,7 @@ class Release28UiTests(unittest.TestCase):
 
     def test_visible_log_has_bounded_history(self):
         self.app._log("line\n" * 3000)
-        self.assertLessEqual(int(self.app.log_text.index("end-1c").split(".")[0]), 2001)
+        self.assertLessEqual(self.window.advanced.log.blockCount(), 2001)
 
     def test_log_batch_preserves_order_around_other_events(self):
         self.app._post("log", "before event")
@@ -234,14 +233,14 @@ class Release28UiTests(unittest.TestCase):
         handler = self.app._handle_ui_event
         def capture(kind, payload):
             if kind == "busy":
-                observed.append(self.app.log_text.get("1.0", "end"))
+                observed.append(self.window.advanced.log.toPlainText())
             handler(kind, payload)
-        with patch.object(self.app, "_handle_ui_event", side_effect=capture), patch.object(self.app, "after"):
+        with patch.object(self.app, "_handle_ui_event", side_effect=capture), patch.object(self.app, "schedule"):
             while not self.app.ui_queue.empty():
                 self.app._drain_ui_queue()
         self.assertIn("before event", observed[0])
         self.assertNotIn("after event", observed[0])
-        self.assertIn("after event", self.app.log_text.get("1.0", "end"))
+        self.assertIn("after event", self.window.advanced.log.toPlainText())
 
     def test_axis_switch_clears_previous_axis_position_reference(self):
         self.app.last_position_inc = 30000

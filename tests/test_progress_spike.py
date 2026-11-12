@@ -1,7 +1,7 @@
 """Progress filtering must reject one-sample spikes without masking a real stall."""
 import unittest
 from unittest.mock import Mock
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 from tests.test_feedback import make_app
 
 

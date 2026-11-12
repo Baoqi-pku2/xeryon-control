@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 from xeryon_control.hardware.stop import verify_disabled
 
 
@@ -37,7 +37,7 @@ def app():
     a._record_motion_event = Mock()
     a._log = Mock()
     a.target_status_var = Mock()
-    a.after = Mock()
+    a.schedule = Mock()
     a._show_error = Mock()
     return a
 

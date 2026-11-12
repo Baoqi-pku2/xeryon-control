@@ -1,17 +1,18 @@
-"""Offline Tk queue stress check. No node or network is created."""
+"""Offline Qt queue stress check. No node or network is created."""
 import argparse
 import json
 import time
 from pathlib import Path
 from unittest.mock import patch
 
-from xeryon_control.ui.main_window import XeryonControlGui
+from xeryon_control.ui.main_window import create_desktop
 
 
 def measure():
-    app = XeryonControlGui()
-    app.withdraw()
-    app.update_idletasks()
+    qt, window = create_desktop()
+    app = window.session
+    window.show()
+    qt.processEvents()
     started = time.perf_counter()
     beats = [started]
     result = {"hardware_connected": False, "queued_logs": 5000, "stop_called": False}
@@ -20,7 +21,7 @@ def measure():
 
     def heartbeat():
         beats.append(time.perf_counter())
-        app.after(20, heartbeat)
+        app.schedule(20, heartbeat)
 
     stop_due = time.perf_counter() + 0.15
     def stop():
@@ -34,17 +35,17 @@ def measure():
             gaps = sorted((right - left) * 1000 for left, right in zip(beats, beats[1:]))
             result.update(elapsed_s=elapsed, remaining_events=app.ui_queue.qsize(),
                           heartbeat_max_gap_ms=max(gaps), heartbeat_p95_gap_ms=gaps[int((len(gaps)-1)*0.95)],
-                          visible_log_lines=int(app.log_text.index("end-1c").split(".")[0]) - 1)
-            app.destroy()
+                          visible_log_lines=window.advanced.log.blockCount())
+            app.finish_exit()
         else:
-            app.after(50, finish_when_drained)
+            app.schedule(50, finish_when_drained)
 
-    app.after(20, heartbeat)
-    app.after(150, stop)
-    app.after(200, finish_when_drained)
+    app.schedule(20, heartbeat)
+    app.schedule(150, stop)
+    app.schedule(200, finish_when_drained)
     # Any accidental transport creation is an immediate verification failure.
-    with patch("xeryon_control.ui.main_window.setup_network", side_effect=AssertionError("Offline check attempted CAN")):
-        app.mainloop()
+    with patch("xeryon_control.application.session.setup_network", side_effect=AssertionError("Offline check attempted CAN")):
+        qt.exec()
     result["passed"] = (result["stop_called"] and result["remaining_events"] == 0
                         and result["heartbeat_max_gap_ms"] < 250
                         and result["stop_callback_delay_ms"] < 250

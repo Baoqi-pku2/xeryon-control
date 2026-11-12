@@ -2,16 +2,16 @@
 import time
 
 
-def capture_endpoint(*, read_position, is_disabled, enable_and_sample, is_enabled,
+def sample_stationary_encoder(*, read_position, is_disabled, enable_and_sample, is_enabled,
                      disable_and_settle, check_cancelled, stop_event):
     check_cancelled()
     if not is_disabled():
-        raise ValueError("请先 STOP，确认驱动器失能后再置零。")
+        raise ValueError("请先按 STOP，确认驱动已关闭。")
     first = read_position()
     time.sleep(0.15)
     baseline = read_position()
     if abs(baseline - first) > 1:
-        raise ValueError("位置仍在变化，未设置零点。")
+        raise ValueError("推杆仍在移动，采样已取消。")
     try:
         enabled = enable_and_sample(baseline)
         settle_until = time.monotonic() + 0.15
@@ -19,7 +19,7 @@ def capture_endpoint(*, read_position, is_disabled, enable_and_sample, is_enable
             check_cancelled()
             last = read_position()
             if abs(last - enabled) > 1 or not is_enabled():
-                raise ValueError("使能采样期间位置或驱动状态发生变化，未设置零点。")
+                raise ValueError("驱动开启时位置或状态有变。采样已取消。")
             remaining = settle_until - time.monotonic()
             if remaining <= 0:
                 break
@@ -28,5 +28,5 @@ def capture_endpoint(*, read_position, is_disabled, enable_and_sample, is_enable
         disabled, position = disable_and_settle()
     check_cancelled()
     if not disabled or abs(position - enabled) > 1 or abs(position - last) > 1:
-        raise ValueError("失能后的反馈与使能采样不一致，未设置零点。")
+        raise ValueError("驱动关闭前后读数不一致。采样已取消。")
     return baseline, enabled, position

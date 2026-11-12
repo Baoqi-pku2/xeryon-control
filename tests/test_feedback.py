@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 from canopen.sdo.exceptions import SdoAbortedError, SdoCommunicationError
 
 

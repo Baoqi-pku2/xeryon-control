@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 
 
 class ProfileJerkTests(unittest.TestCase):

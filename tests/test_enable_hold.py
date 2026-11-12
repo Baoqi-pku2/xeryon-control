@@ -36,11 +36,11 @@ class EnableHoldTests(unittest.TestCase):
         self.assertEqual(node.commands, [])
         samples = [c.args[1] for c in app._post.call_args_list if c.args[0] == "log" and
                    c.args[1].startswith("启动采样")]
-        stages = [("失能已确认", 0x40), ("准备就绪", 0x21), ("Switched On 已确认", 0x23),
-                  ("使能前：写入保持目标前", 0x23), ("使能刚确认", 0x27), ("位置模式反馈已确认", 0x27)]
+        stages = [("SWITCH ON DISABLED", 0x40), ("READY TO SWITCH ON", 0x21), ("SWITCHED ON", 0x23),
+                  ("写入保持目标前", 0x23), ("OPERATION ENABLED", 0x27), ("位置模式反馈已确认", 0x27)]
         self.assertEqual(len(stages), len(samples))
         for sample, (stage, status) in zip(samples, stages):
-            self.assertIn(f"节点 {node.id} · {stage} · 状态字 0x{status:04X}", sample)
+            self.assertIn(f"节点 {node.id}，{stage}，状态字 0x{status:04X}", sample)
             self.assertIn("0x6064 = 3685 计数", sample)
         app._command_profile_position(node, 3900)
         self.assertEqual([c['target_inc'] for c in node.commands], [3900])
@@ -81,7 +81,7 @@ class EnableHoldTests(unittest.TestCase):
     def test_wrong_state_cannot_overwrite_active_target(self):
         app, node, frames = self.setup_case()
         node.registers[0x6041] = 0x27
-        with self.assertRaisesRegex(RuntimeError, "启用前状态不符"):
+        with self.assertRaisesRegex(RuntimeError, "需要 SWITCHED ON"):
             app._initialize_enable_hold(node, 3685)
         self.assertEqual(frames, [])
 
@@ -113,7 +113,7 @@ class EnableHoldTests(unittest.TestCase):
             self.prepare(app, node)
         self.assertEqual(node.commands, [])
         app._disable_drive_worker.assert_called_once()
-        self.assertTrue(any("使能刚确认" in str(c) and "0x6064 = 3662" in str(c)
+        self.assertTrue(any("OPERATION ENABLED" in str(c) and "0x6064 = 3662" in str(c)
                             and "-23 计数" in str(c) for c in app._post.call_args_list))
 
     def zero_case(self):

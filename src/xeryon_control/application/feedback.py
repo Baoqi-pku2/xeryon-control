@@ -50,7 +50,7 @@ def poll_feedback(session, *, rest_seconds) -> None:
             session.stop_unconfirmed = bool(stop_errors)
             session.active_target_inc = None
             session.active_start_inc = None
-            message = "通信异常：已请求停止并失能" if not stop_errors else "通信异常：停止状态未确认，请使用硬件停止"
+            message = "通信异常：已请求停止并关闭驱动" if not stop_errors else "通信异常：停止状态未确认，请使用硬件停止"
             session._record_motion_event("communication_stop", confirmed=not stop_errors, errors=stop_errors)
             session._post("target", message)
             session._post("log", message)
@@ -204,14 +204,14 @@ def _supervise_target(session, node, status):
                                   statusword=statusword)
         session._disable_drive_worker()
         session._post("target", reason)
-        session._post("log", f"{reason}，运动已停止并失能；status=0x{statusword:04X}。")
+        session._post("log", f"{reason}，运动已停止，驱动已关闭；status=0x{statusword:04X}。")
         session._post_shortcut_failure(reason)
     elif overshot:
         session._record_motion_event("stop", reason="passed_target", position_inc=position_inc,
                                   target_inc=session.active_target_inc, statusword=statusword)
         session._disable_drive_worker()
-        session._post("target", "越过目标保护 · 序列已中止")
-        session._post("log", "实时读数已越过目标且超出到位窗口，已停止并失能；请检查控制器轨迹。")
+        session._post("target", "位置越过目标，序列已中止")
+        session._post("log", "位置越过目标和到位窗口。已停止并关闭驱动，请检查轨迹。")
         session._post_shortcut_failure("越过目标保护")
     elif target_reached and close_enough and (now - session.active_target_time) > 0.1:
         reached_um = session._inc_to_um(position_inc)

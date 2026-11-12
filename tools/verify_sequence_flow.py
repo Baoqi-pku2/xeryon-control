@@ -4,6 +4,7 @@ Motion is idealized and accelerated. Dwell uses real monotonic seconds. This
 checks host sequencing, not firmware trajectories or physical performance.
 """
 import argparse
+from xeryon_control.ui.main_window import create_desktop
 import json
 import os
 import time
@@ -11,7 +12,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-from xeryon_control.ui.main_window import XeryonControlGui
 from xeryon_control.domain.shortcut_presets import SHORTCUT_PRESETS
 
 if __package__:
@@ -27,10 +27,11 @@ def run(output, dwell=30.0):
               "motion_time_acceleration": 5000, "dwell_seconds_real_time": dwell,
               "start_clicks": 0, "completed_steps": [], "errors": []}
     with patch.dict(os.environ, {"LOCALAPPDATA": str(output.parent)}), \
-            patch("xeryon_control.ui.main_window.setup_network", side_effect=AssertionError("CAN access forbidden")):
-        app = XeryonControlGui()
-        app.withdraw()
-        app.update_idletasks()
+            patch("xeryon_control.application.session.setup_network", side_effect=AssertionError("CAN access forbidden")):
+        qt, window = create_desktop()
+        app = window.session
+        window.hide()
+        qt.processEvents()
         # No network, node setup or device discovery is performed.
         node = SimulatedNode()
         app.nodes = {"Actuator A": node}
@@ -54,9 +55,9 @@ def run(output, dwell=30.0):
 
         def start():
             for number in range(1, 8):
-                app.position_panel.shortcut_buttons[number].invoke()
+                window.panel.presets[number].click()
             report["start_clicks"] += 1
-            app.position_panel.start_button.invoke()
+            window.panel.start.click()
 
         def watch():
             done = len(report["completed_steps"]) == 7 and app.shortcut_active is None
@@ -78,16 +79,15 @@ def run(output, dwell=30.0):
                     and all(value >= dwell for value in report["inter_step_intervals_s"])
                     and abs(report["final_user_um"]-50) <= app._inc_to_um(1)
                     and report["final_disabled"])
-                (output.parent/"sequence_ui_log.txt").write_text(app.log_text.get("1.0", "end"), encoding="utf-8")
-                for timer in app.tk.call("after", "info"):
-                    app.after_cancel(timer)
-                app.destroy()
+                (output.parent/"sequence_ui_log.txt").write_text(window.advanced.log.toPlainText(), encoding="utf-8")
+                window.finish_exit()
+                qt.quit()
                 return
-            app.after(100, watch)
+            app.schedule(100, watch)
 
-        app.after(50, start)
-        app.after(100, watch)
-        app.mainloop()
+        app.schedule(50, start)
+        app.schedule(100, watch)
+        qt.exec()
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 

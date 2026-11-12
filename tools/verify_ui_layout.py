@@ -1,81 +1,141 @@
-"""Offline responsive Tk checks; no real CAN network can be created."""
+"""Offline Qt layout and control checks at workstation and laptop sizes."""
+
 import argparse
 import json
-import tkinter as tk
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-ROOT = Path(__file__).resolve().parents[1]
-from xeryon_control.ui.main_window import XeryonControlGui
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
+from xeryon_control.ui.main_window import create_desktop
 
 
-def check(output):
-    result = {"hardware_connected": False, "layouts": [], "checks": []}
-    errors = []
-    with patch("xeryon_control.ui.main_window.setup_network", side_effect=AssertionError("Offline check attempted CAN")):
-        app = XeryonControlGui()
-        # This audit injects state explicitly; live polling belongs to the separate
-        # event-loop responsiveness check and would keep update() processing timers.
-        for timer in app.tk.call("after", "info"):
-            app.after_cancel(timer)
-        app.report_callback_exception = lambda *args: errors.append(str(args))
+def check(output, preview=None):
+    result = {"hardware_connected": False, "layouts": []}
+    with patch(
+        "xeryon_control.application.session.setup_network",
+        side_effect=AssertionError("unexpected CAN access"),
+    ):
+        qt, window = create_desktop()
+        session = window.session
         try:
-            panel = app.position_panel
-            for width, height in ((1440, 900), (1320, 820), (1280, 760), (1100, 760)):
-                app.geometry(f"{width}x{height}+0+0")
-                app.update()
-                for _ in range(3):
-                    app.update_idletasks()
-                cards = (panel.connection_card, panel.control_card, panel.visual_card, panel.shortcut_card)
-                overflow = [c.heading.cget("text") for c in cards
-                            if c.winfo_x() < 0 or c.winfo_x() + c.winfo_width() > panel.winfo_width() + 2]
-                button_overflow = [n for n, b in panel.shortcut_buttons.items()
-                                   if b.winfo_x() + b.winfo_width() > panel.shortcut_grid.winfo_width() + 2]
-                stop = app.global_stop_button
-                stop_visible = (stop.winfo_rooty() >= app.winfo_rooty() and
-                                stop.winfo_rootx() + stop.winfo_width() <= app.winfo_rootx() + app.winfo_width())
-                result["layouts"].append({"requested": [width, height],
-                    "actual": [app.winfo_width(), app.winfo_height()], "stacked": panel._compact,
-                    "card_overflow": overflow, "preset_overflow": button_overflow,
-                    "global_stop_visible": stop_visible})
-                assert not overflow and not button_overflow and stop_visible
-                assert all(c.winfo_y() + c.winfo_height() <= panel.winfo_height() + 2 for c in cards)
-                assert panel.control_card.content.winfo_height() >= panel.control_card.content.winfo_reqheight()
-            # Typical long errors remain visible without any page scrolling.
-            app.shortcut_status_var.set("快捷流程中止 · Node 33: Failed to confirm control mode PROFILE_POSITION")
-            app.target_status_var.set("未连接设备 · 无法确认停止，请使用硬件停止")
-            app.update()
-            panel.shortcut_dwell_entry.focus_force()
-            app.update()
-            y = panel.shortcut_dwell_entry.winfo_rooty()
-            assert app.winfo_rooty() <= y < app.winfo_rooty() + app.winfo_height()
-            assert panel.control_card.content.winfo_height() >= panel.control_card.content.winfo_reqheight()
-            result["checks"].append("Controls and long stop status fit without page scrolling")
-            # Preview and selecting presets must not dispatch hardware commands.
-            app._safe_start = Mock()
-            panel.user_target.set("1200")
-            panel.scale.set(1500)
-            panel.shortcut_buttons[1].invoke()
-            panel.shortcut_buttons[3].invoke()
-            assert app.shortcut_selected == [1, 3]
-            app._safe_start.assert_not_called()
-            panel.clear_shortcut_button.invoke()
-            assert not app.shortcut_selected
-            result["checks"].append("Target preview, preset selection and clearing never dispatch motion")
-            app.global_stop_button.invoke()
-            assert app.test_stop_requested.is_set()
-            result["checks"].append("Persistent STOP reaches the existing stop handler")
-            assert not errors, errors
+            window.show()
+            qt.processEvents()
+            for width, height in ((1440, 900), (1320, 820), (1100, 760), (900, 640)):
+                window.resize(width, height)
+                for _ in range(4):
+                    qt.processEvents()
+                panel = window.panel
+                stop = window.global_stop
+                top_left = stop.mapTo(window, QPoint(0, 0))
+                assert window.rect().contains(top_left) and window.rect().contains(
+                    top_left + QPoint(stop.width() - 1, stop.height() - 1)
+                )
+                assert len(panel.presets) == 7 and all(
+                    b.isVisible() for b in panel.presets.values()
+                )
+                assert window.advanced.count() == 6
+                area = window.stack.widget(0)
+                assert window.width() == width, (width, window.width())
+                assert panel.columns == (7 if width >= 1100 else 4)
+                assert area.horizontalScrollBar().maximum() == 0
+                for preset in panel.presets.values():
+                    area.ensureWidgetVisible(preset)
+                    qt.processEvents()
+                    center = preset.mapTo(area.viewport(), preset.rect().center())
+                    assert area.viewport().rect().contains(center)
+                area.verticalScrollBar().setValue(0)
+                assert (
+                    area.verticalScrollBar().maximum()
+                    >= panel.height() - area.viewport().height() - 1
+                )
+                result["layouts"].append(
+                    {
+                        "window": [window.width(), window.height()],
+                        "columns": panel.columns,
+                        "scroll_x": area.horizontalScrollBar().maximum(),
+                        "scroll_y": area.verticalScrollBar().maximum(),
+                    }
+                )
+            # Exercise the two combo variants through their real widgets.
+            current_port = session.channel_var.get()
+            panel.port.lineEdit().selectAll()
+            QTest.keyClicks(panel.port.lineEdit(), "COM47")
+            assert session.channel_var.get() == "COM47"
+            session.channel_var.set(current_port)
+            window.select_page(1)
+            window.advanced.setCurrentIndex(1)
+            encoder = window.advanced.encoder
+            original_encoder = session.encoder_var.get()
+            window.advanced.currentWidget().ensureWidgetVisible(encoder)
+            window.activateWindow()
+            encoder.setFocus()
+            qt.processEvents()
+            QTest.mouseClick(encoder, Qt.MouseButton.LeftButton,
+                             pos=QPoint(encoder.width() - 12, encoder.height() // 2))
+            assert QTest.qWaitForWindowExposed(encoder.view().window(), 2000)
+            assert encoder.view().isVisible()
+            QTest.keyClick(encoder.view(), Qt.Key.Key_End)
+            QTest.keyClick(encoder.view(), Qt.Key.Key_Return)
+            qt.processEvents()
+            assert session.encoder_var.get() == encoder.itemText(encoder.count() - 1)
+            assert not encoder.view().isVisible()
+            session.encoder_var.set(original_encoder)
+            window.select_page(0)
+            session._safe_start = Mock()
+            panel.slider.setValue(1500)
+            panel.presets[1].click()
+            panel.presets[3].click()
+            assert session.shortcut_selected == [1, 3]
+            session._safe_start.assert_not_called()
+            panel.clear.click()
+            assert not session.shortcut_selected
+            window.global_stop.click()
+            assert session.test_stop_requested.is_set()
+            if preview:
+                for timer in tuple(window._timers):
+                    window.cancel_timer(timer)
+                session.test_stop_requested.clear()
+                session.channel_var.set("COM4")
+                session._set_connected_state(True)
+                session.node = Mock(id=32)
+                session.network = Mock()
+                session.nodes = {"Actuator A": session.node}
+                panel.model.apply_user_zero(-37000, time.monotonic())
+                session._set_status(
+                    dict(
+                        axis="Actuator A",
+                        position_um=-34550,
+                        position_inc=session._um_to_inc(-34550),
+                        sample_time=time.monotonic(),
+                        statusword=0x0650,
+                        state="SWITCH ON DISABLED",
+                        mode="PROFILE_POSITION",
+                    )
+                )
+                panel.model.user_target.set("3350")
+                panel.model.speed.set("300")
+                panel.model.span.set("5000")
+                panel.model.center_view()
+                session.target_status_var.set("等待启动")
+                session._update_shortcut_status()
+                window.resize(1440, 850)
+                window.refresh()
+                qt.processEvents()
+                assert window.grab().save(str(preview))
         finally:
-            for timer in app.tk.call("after", "info"):
-                app.after_cancel(timer)
-            app.destroy()
+            window.finish_exit()
     result["passed"] = True
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    output.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    check(parser.parse_args().output)
+    parser.add_argument("--preview", type=Path)
+    args = parser.parse_args()
+    check(args.output, args.preview)

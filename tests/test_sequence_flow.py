@@ -1,10 +1,11 @@
 """Sequence dwell, real-resolution edge geometry, and fault rejection. No CAN."""
 import time
 import unittest
+from tests.qt_support import create_console
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 from xeryon_control.domain.travel import TravelRange
 from tests.test_feedback import make_app
 
@@ -60,9 +61,8 @@ class SequenceGeometryTests(unittest.TestCase):
 
 class SequenceDwellTests(unittest.TestCase):
     def setUp(self):
-        self.app = Gui()
-        self.app.withdraw()
-        self.app.update_idletasks()
+        self.window = create_console()
+        self.app = self.window.session
         self.node = NS(id=33)
         self.app.node = self.node
         self.app.nodes = {"Actuator A": self.node}
@@ -71,9 +71,8 @@ class SequenceDwellTests(unittest.TestCase):
         self.app._show_error = Mock()
 
     def tearDown(self):
-        for timer in self.app.tk.call("after", "info"):
-            self.app.after_cancel(timer)
-        self.app.destroy()
+        self.window.finish_exit()
+        self.window.deleteLater()
 
     def start_pair(self):
         self.app.toggle_shortcut(1)
@@ -92,10 +91,10 @@ class SequenceDwellTests(unittest.TestCase):
         deadline = self.app.shortcut_wait_deadline
         self.app._handle_shortcut_done(generation)
         self.assertEqual(self.app.shortcut_wait_deadline, deadline)
-        with patch("xeryon_control.ui.main_window.time.monotonic", return_value=deadline - 0.01):
+        with patch("xeryon_control.application.session.time.monotonic", return_value=deadline - 0.01):
             self.app._continue_shortcut_after_dwell(generation)
         self.app._safe_start.assert_called_once()
-        with patch("xeryon_control.ui.main_window.time.monotonic", return_value=deadline + 0.01), \
+        with patch("xeryon_control.application.session.time.monotonic", return_value=deadline + 0.01), \
                 patch.object(self.app.position_panel, "is_fresh", return_value=True):
             self.app._continue_shortcut_after_dwell(generation)
         self.assertEqual(self.app._safe_start.call_count, 2)

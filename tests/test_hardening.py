@@ -7,7 +7,7 @@ from xeryon_control.config import EDS_PATH
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui
+from xeryon_control.application.session import ControllerSession as Gui
 from xeryon_control.hardware import canopen_io as utils
 from xeryon_control.hardware.parameters import NodeOperationMode
 from xeryon_control.application.repeatability import run_repeatability
@@ -50,7 +50,7 @@ def make_app():
     app._log = Mock()
     app._record_motion_event = Mock()
     app._show_error = Mock()
-    app.after = Mock()
+    app.schedule = Mock()
     return app
 
 
@@ -80,7 +80,7 @@ class HardeningTests(unittest.TestCase):
     def test_canable_preferred_over_bluetooth_and_refresh_keeps_explicit_choice(self):
         ports = [NS(device="COM9", vid=None, pid=None),
                  NS(device="COM4", vid=0xAD50, pid=0x60C4)]
-        with patch("xeryon_control.ui.main_window.list_ports.comports", return_value=ports):
+        with patch("xeryon_control.application.session.list_ports.comports", return_value=ports):
             names, preferred = Gui._serial_port_choices()
             self.assertCountEqual(names, ["COM4", "COM9"])
             self.assertEqual(preferred, "COM4")
@@ -159,8 +159,8 @@ class HardeningTests(unittest.TestCase):
         config = dict(encoder="1MU", interface="slcan", channel="FAKE", bitrate=125000,
                       node_id=33, eds_path=eds_path, node_b_enabled=False,
                       reset_on_connect=False, boot_timeout=1)
-        with patch("xeryon_control.ui.main_window.setup_network", return_value=(network, eds_path)), \
-             patch("xeryon_control.ui.main_window.BaseNode402", return_value=node):
+        with patch("xeryon_control.application.session.setup_network", return_value=(network, eds_path)), \
+             patch("xeryon_control.application.session.BaseNode402", return_value=node):
             app._connect_worker(config)
         app._disable_nodes.assert_called_once_with([node])
         self.assertFalse(app.stop_unconfirmed)
@@ -185,8 +185,8 @@ class HardeningTests(unittest.TestCase):
         config = dict(encoder="1MU", interface="slcan", channel="FAKE", bitrate=125000,
                       node_id=32, node_b_enabled=True, node_b_id=33, eds_path=eds_path,
                       reset_on_connect=False, boot_timeout=1)
-        with patch("xeryon_control.ui.main_window.setup_network", return_value=(network, eds_path)), \
-             patch("xeryon_control.ui.main_window.BaseNode402", side_effect=nodes):
+        with patch("xeryon_control.application.session.setup_network", return_value=(network, eds_path)), \
+             patch("xeryon_control.application.session.BaseNode402", side_effect=nodes):
             app._connect_worker(config)
         self.assertEqual(app._configure_connected_node.call_count, 2)
         for call in app._configure_connected_node.call_args_list:
@@ -307,8 +307,8 @@ class HardeningTests(unittest.TestCase):
         app.node_identities = {33: (1, 2, 3, 44)}
         app.position_panel.user_zero_um = 8000
         app._safe_start = lambda label, worker: worker()
-        with patch("xeryon_control.ui.main_window.lss_read_identity_via_sdo", return_value=(1, 2, 3, 44)), \
-             patch("xeryon_control.ui.main_window.verify_disabled", side_effect=[
+        with patch("xeryon_control.application.session.lss_read_identity_via_sdo", return_value=(1, 2, 3, 44)), \
+             patch("xeryon_control.application.session.verify_disabled", side_effect=[
                  {"position_inc": 19200, "statusword": 0x40},
                  {"position_inc": 19001, "statusword": 0x40},
              ]):
@@ -320,7 +320,7 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNone(app.reference_review)
         self.assertEqual(app.position_panel.user_zero_um, 8000)
         app.reference_review = {"Actuator A": 19000}
-        with patch("xeryon_control.ui.main_window.lss_read_identity_via_sdo", return_value=(1, 2, 3, 45)):
+        with patch("xeryon_control.application.session.lss_read_identity_via_sdo", return_value=(1, 2, 3, 45)):
             with self.assertRaisesRegex(RuntimeError, "身份"):
                 app.review_reference()
         with self.assertRaisesRegex(RuntimeError, "重新标定"):
@@ -361,7 +361,7 @@ class HardeningTests(unittest.TestCase):
             node.sdo["Statusword"] = NS(raw=expected)
             return expected
         app._motion_state = Mock(side_effect=enable_changes_actual_mode)
-        with patch("xeryon_control.ui.main_window.wait_for_node_operation_mode",
+        with patch("xeryon_control.application.session.wait_for_node_operation_mode",
                    side_effect=lambda n, m, **kwargs: utils.wait_for_node_operation_mode(n, m, timeout=0.01, **kwargs)):
             app._prepare_profile_position(node, {"position_window_inc": 5, "position_window_time": 200})
         self.assertEqual(order, ["profile", 0x00, 0x06, 0x07, 0x0F])
@@ -386,7 +386,7 @@ class HardeningTests(unittest.TestCase):
                 node.sdo[0x6061].raw = NodeOperationMode.HOMING.value
             return expected
         app._motion_state = Mock(side_effect=enable_selects_wrong_mode)
-        with patch("xeryon_control.ui.main_window.wait_for_node_operation_mode",
+        with patch("xeryon_control.application.session.wait_for_node_operation_mode",
                    side_effect=lambda n, m, **kwargs: utils.wait_for_node_operation_mode(n, m, timeout=0.01, **kwargs)):
             with self.assertRaisesRegex(TimeoutError, "actual.*reports 6"):
                 app._move_absolute_worker(1000, {"position_window_inc": 5, "position_window_time": 200}, {})
@@ -469,8 +469,8 @@ class HardeningTests(unittest.TestCase):
         app._motion_state = Mock()
         app._write_controlword = Mock()
         app._disable_drive_worker = Mock()
-        with patch("xeryon_control.ui.main_window.set_node_operation_mode"), \
-             patch("xeryon_control.ui.main_window.wait_for_node_operation_mode", side_effect=TimeoutError("wrong mode")):
+        with patch("xeryon_control.application.session.set_node_operation_mode"), \
+             patch("xeryon_control.application.session.wait_for_node_operation_mode", side_effect=TimeoutError("wrong mode")):
             with self.assertRaisesRegex(TimeoutError, "wrong mode"):
                 app._home_worker(True, 0, 1)
         app._write_controlword.assert_not_called()
@@ -572,16 +572,15 @@ class HardeningTests(unittest.TestCase):
         app._cancel_shortcut_queue = Mock()
         app._run_stop_command = Mock()
         app._show_close_notice = Mock(side_effect=lambda: setattr(app, "close_notice", Mock()))
-        app._center_notice = Mock()
-        app.destroy = Mock()
+        app.finish_exit = Mock()
         app._on_close()
         app._run_stop_command.assert_called_once()
-        app.destroy.assert_not_called()
-        app._on_close()
-        app._center_notice.assert_called_once_with(app.close_notice)
-        app._run_stop_command.assert_called_once()
-        app.destroy.assert_not_called()
+        app.finish_exit.assert_not_called()
         app._show_close_notice.assert_called_once()
+        app._on_close()
+        self.assertEqual(app._show_close_notice.call_count, 2)
+        app._run_stop_command.assert_called_once()
+        app.finish_exit.assert_not_called()
         app._show_error.assert_not_called()
 
     def test_close_destroys_only_after_background_cleanup_finishes(self):
@@ -597,18 +596,18 @@ class HardeningTests(unittest.TestCase):
         app._disable_drive_worker = Mock()
         app.stop_unconfirmed = False
         app._run_command = Mock()
-        app.destroy = Mock()
+        app.finish_exit = Mock()
         app._finish_close()
         label, cleanup = app._run_command.call_args.args
         self.assertEqual(label, "Disconnect")
         cleanup()
         network.disconnect.assert_called_once()
         app._disable_drive_worker.assert_not_called()
-        app.destroy.assert_not_called()
-        app.after.assert_called_with(100, app._finish_close)
+        app.finish_exit.assert_not_called()
+        app.schedule.assert_called_with(100, app._finish_close)
         app.close_cleanup_started = True
         app._finish_close()
-        app.destroy.assert_called_once()
+        app.finish_exit.assert_called_once()
 
     def test_hung_transport_offers_exit_and_keeps_motion_blocked(self):
         app = make_app()
@@ -616,10 +615,10 @@ class HardeningTests(unittest.TestCase):
         app.stop_pending = app.close_in_progress = app.close_stop_requested = True
         app.close_deadline = 0
         app._show_close_notice = Mock()
-        app.destroy = Mock()
+        app.finish_exit = Mock()
         app._finish_close()
         app._show_close_notice.assert_called_once()
-        app.destroy.assert_not_called()
+        app.finish_exit.assert_not_called()
         with self.assertRaisesRegex(RuntimeError, "不能提交"):
             app._run_command("Move absolute", Mock())
 

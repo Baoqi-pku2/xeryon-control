@@ -22,13 +22,13 @@ class StopCoordinator:
         if self.__dict__.get("close_in_progress") and label != "Close":
             return
         if not self.nodes:
-            notify("未连接设备 · 无法确认停止，请使用硬件停止")
+            notify("未连接，无法确认停止。请使用硬件停止")
             return
         self.stop_verified = False
         self.stop_pending = True
         self.cancel_generation += 1
         self.test_stop_requested.set()
-        notify("正在停止 · 等待设备确认")
+        notify("等待设备确认停止")
         self._log(f"{label} requested.")
         thread = threading.Thread(target=self._stop_runner, args=(label,), daemon=True)
         thread.start()
@@ -62,7 +62,7 @@ class StopCoordinator:
             self._post("log", f"{label} complete.")
         except Exception as exc:
             self.stop_unconfirmed = True
-            self._post("target", "停止未确认 · 请关闭驱动器电源")
+            self._post("target", "停止未确认，请断开驱动电源")
             self._post("log", f"{label} failed: {exc}")
             self._post("error", f"停止未确认，请关闭驱动器电源。\n{exc}")
         finally:
@@ -81,7 +81,7 @@ class StopCoordinator:
         except Exception as exc:
             self.stop_unconfirmed = True
             self._record_motion_event("disable_failed", error=str(exc))
-            self._post("target", "停止未确认 · 请关闭驱动器电源")
+            self._post("target", "停止未确认，请断开驱动电源")
             raise
         else:
             self.stop_unconfirmed = False
@@ -92,7 +92,7 @@ class StopCoordinator:
                         self.__dict__.setdefault("reference_positions", {})[axis] = count
                         if axis == self._active_axis_name():
                             self.last_position_inc = count
-            self._post("target", "已停止 · 已核对失能与位置稳定")
+            self._post("target", "已停止。驱动已关闭，位置稳定")
             return result
         finally:
             self.active_target_inc = None
@@ -107,7 +107,7 @@ class StopCoordinator:
         remaining = abs(int(stopped["position_inc"]) - int(target_inc))
         if remaining > max(1, self.runtime_position_window_inc):
             raise RuntimeError(
-                f"失能后终点偏离目标 {self._inc_to_um(remaining):.2f} µm，"
+                f"驱动关闭后终点偏离目标 {self._inc_to_um(remaining):.2f} µm，"
                 f"status=0x{int(stopped['statusword']):04X}"
             )
 

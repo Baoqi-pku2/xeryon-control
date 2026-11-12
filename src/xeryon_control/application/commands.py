@@ -36,9 +36,9 @@ class CommandDispatcher:
             raise RuntimeError("上次停止未确认，禁止新命令。请确认硬件已停止后断开并重新连接。")
         shortcut_running = self.__dict__.get("shortcut_active") is not None or bool(self.__dict__.get("shortcut_pending"))
         if shortcut_running and label != "Disconnect" and not label.startswith("快捷 "):
-            raise RuntimeError("快捷流程进行中：请等待完成，或使用 STOP 停止后再操作。")
+            raise RuntimeError("快捷流程进行中。请等待完成，或按 STOP。")
         if self.active_target_inc is not None and label != "Disconnect":
-            raise RuntimeError("运动进行中：请等待到位，或使用 STOP 停止并确认失能后再操作。")
+            raise RuntimeError("运动进行中。请等待到位，或按 STOP 并确认驱动已关闭。")
         if self.command_busy:
             raise RuntimeError(f"{label} 未提交：另一条命令仍在执行，请等待完成。")
 

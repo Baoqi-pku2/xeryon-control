@@ -19,4 +19,4 @@ jobs:
           version: '0.10.12'
           enable-cache: false
       - name: Offline unit tests (no hardware)
-        run: .\project_uv.cmd run --locked python -m unittest discover -s tests -p "test_*.py" -v
+        run: uv run --locked python -m unittest discover -s tests -p "test_*.py" -v

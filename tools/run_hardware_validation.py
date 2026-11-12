@@ -4,6 +4,7 @@ Reference must be the operator-confirmed retracted endpoint count.
 No flash writes, homing, automatic retry or fault bypass. STOP/Esc remain live.
 """
 import argparse
+from xeryon_control.ui.main_window import create_desktop
 import hashlib
 import json
 import os
@@ -11,8 +12,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-from xeryon_control.ui.main_window import XeryonControlGui
-from xeryon_control.ui import main_window as control_gui
+from xeryon_control.application import session as control_gui
 from xeryon_control.domain import shortcut_presets
 
 
@@ -47,8 +47,10 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix('.harness.py').write_bytes(Path(__file__).read_bytes())
     os.environ["LOCALAPPDATA"] = str(output.parent)
-    app = XeryonControlGui()
-    app.title(app.title() + " · 空载实机验证 / STOP 可中止")
+    qt, window = create_desktop()
+    app = window.session
+    window.show()
+    window.setWindowTitle(window.windowTitle() + " · 空载实机验证 / STOP 可中止")
     app.channel_var.set("COM3")
     app.node_id_var.set("33")
     app.reset_on_connect_var.set(False)
@@ -61,7 +63,7 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
     report = {"phase": phase, "reference_count": reference_count, "speed_um_s": speed,
               "acceleration_um_s2": acceleration, "hardware_motion": True,
               "errors": [], "steps": [], "start_clicks": 0}
-    report["source_sha256"] = hashlib.sha256((ROOT / "src/xeryon_control/ui/main_window.py").read_bytes()).hexdigest()
+    report["source_sha256"] = hashlib.sha256((ROOT / "src/xeryon_control/application/session.py").read_bytes()).hexdigest()
     report['harness_sha256'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     verified_stops = {}
     original_record = app._record_motion_event
@@ -111,7 +113,7 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
                       target_status=app.target_status_var.get(), sequence_status=app.shortcut_status_var.get(),
                       final_position_inc=app.last_position_inc, stop_unconfirmed=app.stop_unconfirmed)
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        output.with_suffix(".log").write_text(app.log_text.get("1.0", "end"), encoding="utf-8")
+        output.with_suffix(".log").write_text(window.advanced.log.toPlainText(), encoding="utf-8")
 
     def finish(result):
         nonlocal finished
@@ -129,7 +131,7 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
         app.position_panel.speed.set(str(speed))
         app.position_panel.redraw()
         report["start_clicks"] += 1
-        app.position_panel.start_button.invoke()
+        window.panel.start.click()
         report["steps"].append({"target_inc": target_inc, "submitted_s": time.monotonic()-started})
         next_step += 1
         state = "local_moving"
@@ -160,9 +162,9 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
             app.position_panel.apply_travel()
             if sequence:
                 for number in range(1, 8):
-                    app.position_panel.shortcut_buttons[number].invoke()
+                    window.panel.presets[number].click()
                 report["start_clicks"] += 1
-                app.position_panel.start_button.invoke()
+                window.panel.start.click()
                 state = "sequence_moving"
             else:
                 # Both targets must pass the application's real travel/default
@@ -196,11 +198,11 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
             finish("PASSED" if len(report["steps"]) == 7 and len(intervals) == 6
                    and all(value >= 30 for value in intervals) else "FAILED")
             return
-        app.after(tick_ms, tick)
+        app.schedule(tick_ms, tick)
 
-    app.after(100, app.connect_device)
-    app.after(200, tick)
-    app.mainloop()
+    app.schedule(100, app.connect_device)
+    app.schedule(200, tick)
+    qt.exec()
     if not finished:
         # User close is not successful completion of a test.
         report.update(result="CLOSED_BY_USER", elapsed_s=time.monotonic()-started)

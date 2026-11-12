@@ -4,14 +4,14 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.main_window import XeryonControlGui as Gui, STATUS_POLL_REST_SECONDS
+from xeryon_control.application.session import ControllerSession as Gui, STATUS_POLL_REST_SECONDS
 
 
 class StatusPollSpacingTests(unittest.TestCase):
     def app(self):
         return NS(node=object(), status_busy=False, command_busy=False,
                   stop_pending=False, stop_unconfirmed=False,
-                  next_status_poll_time=10.1, after=Mock(),
+                  next_status_poll_time=10.1, schedule=Mock(),
                   _poll_status=Mock(), _status_worker=Mock())
 
     def test_no_read_during_reserved_idle_window(self):
@@ -19,7 +19,7 @@ class StatusPollSpacingTests(unittest.TestCase):
         with patch('xeryon_control.application.feedback.time.monotonic', return_value=10), patch('xeryon_control.application.feedback.threading.Thread') as thread:
             Gui._poll_status(app)
         thread.assert_not_called()
-        app.after.assert_called_once()
+        app.schedule.assert_called_once()
         self.assertFalse(app.status_busy)
 
     def test_read_resumes_after_idle_without_overlapping(self):
