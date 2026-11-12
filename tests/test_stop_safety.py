@@ -27,8 +27,7 @@ def app():
     a.io_lock = threading.RLock()
     a.controlword_lock = threading.Lock()
     a.test_stop_requested = threading.Event()
-    a.stop_pending = False
-    a.stop_unconfirmed = False
+    a._init_stop_control()
     a.cancel_generation = 0
     a.nodes = {"A": node()}
     a.node = a.nodes["A"]
@@ -79,7 +78,7 @@ class StopTests(unittest.TestCase):
         a._write_controlword = Mock()
         other = node()
         other.id = 33
-        with patch('xeryon_control.ui.main_window.verify_disabled', return_value={}) as verify:
+        with patch('xeryon_control.application.stop.verify_disabled', return_value={}) as verify:
             a._disable_nodes([a.node, other])
         self.assertEqual([c.args[1] for c in a._write_controlword.call_args_list],[0,0])
         self.assertEqual(verify.call_count,2)
@@ -98,7 +97,7 @@ class StopTests(unittest.TestCase):
         a._write_controlword = Mock(side_effect=lambda *args: sent.set())
         a._stop_and_disable_worker = Mock()
         with a.io_lock:
-            worker = threading.Thread(target=a._stop_runner,args=('STOP',Mock()))
+            worker = threading.Thread(target=a._stop_runner,args=('STOP',))
             worker.start()
             self.assertTrue(sent.wait(0.5), 'STOP waited behind I/O lock')
             a._stop_and_disable_worker.assert_not_called()
@@ -127,7 +126,7 @@ class StopTests(unittest.TestCase):
                 a.stop_pending = True
                 a.cancel_generation += 1
                 a.test_stop_requested.set()
-                worker = threading.Thread(target=a._stop_runner, args=("STOP", Mock()))
+                worker = threading.Thread(target=a._stop_runner, args=("STOP",))
                 worker.start()
             return expected
         a._motion_state = Mock(side_effect=request_stop)
@@ -170,7 +169,7 @@ class StopTests(unittest.TestCase):
                 a.stop_pending = True
                 a.cancel_generation += 1
                 a.test_stop_requested.set()
-                worker = threading.Thread(target=a._stop_runner, args=("STOP", a._stop_and_disable_worker))
+                worker = threading.Thread(target=a._stop_runner, args=("STOP",))
                 worker.start()
                 raise RuntimeError("模式等待取消")
         a._prepare_profile_position = Mock(side_effect=fail_second_axis)
@@ -179,8 +178,8 @@ class StopTests(unittest.TestCase):
         def transport(node, value):
             node.sdo[0x6040].raw = value
             node.sdo[0x6041].value = 0x40 if value == 0 else 0x27
-        with patch("xeryon_control.ui.main_window.set_controlword", side_effect=transport), \
-             patch("xeryon_control.ui.main_window.verify_disabled", wraps=verify_disabled) as verified, \
+        with patch("xeryon_control.application.commands.set_controlword", side_effect=transport), \
+             patch("xeryon_control.application.stop.verify_disabled", wraps=verify_disabled) as verified, \
              patch.object(a, "_stop_and_disable_worker", wraps=a._stop_and_disable_worker) as stopped:
             a._command_runner("linked STOP", lambda: a._run_linked_move(
                 {"Actuator A": 1000, "Actuator B": 1000}, {"position_window_inc": 50}, 1, link,
@@ -225,7 +224,7 @@ class StopTests(unittest.TestCase):
                 a.stop_pending = True
                 a.cancel_generation += 1
                 a.test_stop_requested.set()
-                worker = threading.Thread(target=a._stop_runner, args=("STOP", a._stop_and_disable_worker))
+                worker = threading.Thread(target=a._stop_runner, args=("STOP",))
                 worker.start()
             time.sleep(0.26)
             return 0x27
@@ -236,8 +235,8 @@ class StopTests(unittest.TestCase):
         def transport(node, value):
             node.sdo[0x6040].raw = value
             node.sdo[0x6041].value = 0x40 if value == 0 else 0x27
-        with patch("xeryon_control.ui.main_window.set_controlword", side_effect=transport), \
-             patch("xeryon_control.ui.main_window.verify_disabled", wraps=verify_disabled) as verified, \
+        with patch("xeryon_control.application.commands.set_controlword", side_effect=transport), \
+             patch("xeryon_control.application.stop.verify_disabled", wraps=verify_disabled) as verified, \
              patch.object(a, "_stop_and_disable_worker", wraps=a._stop_and_disable_worker) as stopped:
             a._command_runner("linked feedback STOP", lambda: results.append(a._run_linked_move(
                 {"Actuator A": 1000, "Actuator B": 1000}, {"position_window_inc": 50}, 1, link,
@@ -255,22 +254,22 @@ class StopTests(unittest.TestCase):
     def test_cancelled_motion_cannot_overwrite_stop(self):
         a = app()
         a.test_stop_requested.set()
-        with patch('xeryon_control.ui.main_window.set_controlword') as send:
+        with patch('xeryon_control.application.commands.set_controlword') as send:
             a._write_controlword(a.node,0)
             for word in (0x0F,0x1F,0x10F):
                 with self.assertRaises(RuntimeError):
                     a._write_controlword(a.node,word)
             self.assertEqual(send.call_count,1)
-        with patch('xeryon_control.ui.main_window.set_target_position') as target:
+        with patch('xeryon_control.application.commands.set_target_position') as target:
             with self.assertRaises(RuntimeError):
                 a._write_target_position(a.node,500)
             target.assert_not_called()
 
     def test_repeat_clicks_do_not_queue_stop_threads(self):
         a = app()
-        with patch('xeryon_control.ui.main_window.threading.Thread') as thread:
-            a._run_stop_command('STOP',Mock())
-            a._run_stop_command('STOP',Mock())
+        with patch('xeryon_control.application.stop.threading.Thread') as thread:
+            a._run_stop_command('STOP')
+            a._run_stop_command('STOP')
             self.assertEqual(thread.call_count,1)
         self.assertTrue(a.test_stop_requested.is_set())
 
@@ -291,7 +290,7 @@ class StopTests(unittest.TestCase):
         a._require_node = Mock(return_value=a.node)
         a._disable_drive_worker = Mock()
         a.test_stop_requested.set()
-        with patch('xeryon_control.ui.main_window.set_controlword') as send:
+        with patch('xeryon_control.application.commands.set_controlword') as send:
             with self.assertRaises(RuntimeError):
                 a._home_worker(True,0,10)
             send.assert_not_called()
@@ -392,7 +391,7 @@ class StopTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "运动进行中"):
             a._run_command("Enable drive", run)
         run.assert_not_called()
-        with patch('xeryon_control.ui.main_window.threading.Thread') as thread:
+        with patch('xeryon_control.application.commands.threading.Thread') as thread:
             a._run_command("Disconnect", run)
             thread.assert_called_once()
 

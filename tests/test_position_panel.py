@@ -231,7 +231,7 @@ class PositionPanelTests(unittest.TestCase):
 
     def test_stop_invalidates_open_confirmation(self):
         review = self._setup_shifted_start()
-        with patch("xeryon_control.ui.main_window.threading.Thread"):
+        with patch("xeryon_control.application.stop.threading.Thread"):
             self.app.stop_actuator_test()
         self.app._continue_start(review)
         self.assertIsNone(self.app.start_confirmation)

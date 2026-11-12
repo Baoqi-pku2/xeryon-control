@@ -57,6 +57,7 @@ def make_app():
 def linked_app():
     app = make_app()
     app.linked_mode_enabled = True
+    app.pair_tolerance_um = 20.0
     app.linked_zero_offsets_inc = {"Actuator A": 0, "Actuator B": 0}
     app.travel_ranges = {}
     for axis in ("Actuator A", "Actuator B"):
@@ -773,7 +774,7 @@ class HardeningTests(unittest.TestCase):
             app.cancel_generation += 1
             app.test_stop_requested.clear()
             app._write_controlword(app.node, 0x0F)
-        with patch("xeryon_control.ui.main_window.set_controlword") as send:
+        with patch("xeryon_control.application.commands.set_controlword") as send:
             app._command_runner("old move", old_command, 0)
             send.assert_not_called()
 

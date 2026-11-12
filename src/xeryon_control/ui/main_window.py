@@ -6,7 +6,6 @@ import csv
 import os
 import queue
 import sys
-import threading
 import time
 import tkinter as tk
 from dataclasses import replace
@@ -21,6 +20,13 @@ from serial.tools import list_ports
 
 from xeryon_control.hardware.parameters import CANBitrate, EncoderRes, HomingMethod, NodeOperationMode, NodeState
 from xeryon_control.reporting.traces import append_event, new_trace_path, results_folder
+from xeryon_control.application.stop import StopCoordinator
+from xeryon_control.application.commands import CommandDispatcher
+from xeryon_control.application.feedback import (
+    FeedbackMonitoring, MOTION_PROGRESS_EPSILON_UM, MOTION_STALL_TIMEOUT_SECONDS,
+    poll_feedback, start_poll_if_due,
+)
+from xeryon_control.application.linked_motion import LinkedMotion
 from xeryon_control.application.motion import PanelMotion, StartConfirmation, StartupDisplacement
 from xeryon_control.application.calibration import capture_endpoint
 from xeryon_control.hardware.drive import command_profile_positions, check_halted_profile_mode, operation_disabled
@@ -36,13 +42,10 @@ from xeryon_control.hardware.stop import verify_disabled
 from xeryon_control.hardware.canopen_io import (
     BIT,
     bound_can_write_timeout,
-    error_handler,
     homing,
     lss_read_identity_via_sdo,
-    set_controlword,
     set_node_operation_mode,
     set_node_state,
-    set_target_position,
     setup_network,
     wait_for_node_operation_mode,
 )
@@ -66,14 +69,9 @@ STATUS_POLL_REST_SECONDS = 0.1
 UI_EVENTS_PER_TICK = 100
 UI_EVENT_BUDGET_SECONDS = 0.01
 LOG_MAX_LINES = 2000
-PDO_MAX_AGE_SECONDS = 1.0
-CONTROLLER_TRACE_INTERVAL_SECONDS = 2.0
 SETPOINT_ACK_TIMEOUT_SECONDS = 2.0
 TPDO3_INHIBIT_TIME_100US = 200
-MOTION_PROGRESS_EPSILON_UM = 1.0
-MOTION_STALL_TIMEOUT_SECONDS = 10.0
 POSITION_REFERENCE_TOLERANCE_UM = 20.0
-PAIR_MISMATCH_TIMEOUT_SECONDS = 1.0
 MANUAL_TIMEOUT_FACTOR = 2.0
 MANUAL_TIMEOUT_MARGIN_SECONDS = 30.0
 PROFILE_VELOCITY_LIMIT_UM_S = 400_000.0
@@ -100,7 +98,7 @@ FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
 
-class XeryonControlGui(tk.Tk):
+class XeryonControlGui(CommandDispatcher, StopCoordinator, FeedbackMonitoring, LinkedMotion, tk.Tk):
     """Motion-control GUI for one or two Xeryon actuators."""
 
     def __init__(self) -> None:
@@ -119,13 +117,8 @@ class XeryonControlGui(tk.Tk):
         self.network = None
         self.node: Optional[BaseNode402] = None
         self.nodes: dict[str, BaseNode402] = {}
-        self.io_lock = threading.RLock()
-        self.controlword_lock = threading.Lock()
-        self.stop_pending = False
-        self.stop_verified = False
-        self.stop_unconfirmed = False
-        self.cancel_generation = 0
-        self.command_busy = False
+        self._init_command_dispatch()
+        self._init_stop_control()
         self.status_busy = False
         self.active_target_inc: Optional[int] = None
         self.active_start_inc: Optional[int] = None
@@ -133,7 +126,6 @@ class XeryonControlGui(tk.Tk):
         self.active_target_deadline = 0.0
         self.active_best_remaining_inc: Optional[int] = None
         self.active_last_progress_time = 0.0
-        self.test_stop_requested = threading.Event()
         self.last_position_inc: Optional[int] = None
         self.runtime_position_window_inc = self._um_to_inc(20.0)
         self.linked_zero_offsets_inc: dict[str, int] = {}
@@ -875,7 +867,7 @@ class XeryonControlGui(tk.Tk):
         self._cancel_shortcut_queue("快捷流程已断开")
         self.test_stop_requested.set()
         if self.nodes:
-            self._run_stop_command("Disconnect", self._stop_and_disable_worker)
+            self._run_stop_command("Disconnect")
         self.after(100, self._finish_disconnect)
 
     def _finish_disconnect(self) -> None:
@@ -1349,17 +1341,17 @@ class XeryonControlGui(tk.Tk):
     def halt_motion(self) -> None:
         self._cancel_shortcut_queue("快捷流程已停止")
         self.test_stop_requested.set()
-        self._run_stop_command("Halt", self._halt_worker)
+        self._run_stop_command("Halt")
 
     def stop_target_motion(self) -> None:
         self._cancel_shortcut_queue("快捷流程已停止")
         self.test_stop_requested.set()
-        self._run_stop_command("Stop target", self._halt_worker)
+        self._run_stop_command("Stop target")
 
     def quick_stop(self) -> None:
         self._cancel_shortcut_queue("快捷流程已停止")
         self.test_stop_requested.set()
-        self._run_stop_command("Quick stop", self._quick_stop_worker)
+        self._run_stop_command("Quick stop")
 
     def set_linked_zero(self) -> None:
         self._safe_start("Set pair zero", self._set_linked_zero_worker)
@@ -1394,12 +1386,8 @@ class XeryonControlGui(tk.Tk):
     def stop_actuator_test(self) -> None:
         self._cancel_shortcut_queue("快捷流程已停止")
         self.test_stop_requested.set()
-        self._run_stop_command("STOP", self._stop_and_disable_worker)
+        self._run_stop_command("STOP")
 
-    def _stop_and_disable_worker(self) -> None:
-        if not self.nodes:
-            return
-        self._disable_drive_worker()
 
     def run_standard_cycle(self, retreat: bool) -> None:
         try:
@@ -1450,7 +1438,12 @@ class XeryonControlGui(tk.Tk):
     def stop_standard_cycle(self) -> None:
         self._cancel_shortcut_queue("快捷流程已停止")
         self.test_stop_requested.set()
-        self._run_stop_command("Stop cycle", self._quick_stop_worker)
+        self._run_stop_command("Stop cycle")
+
+    def _on_command_started(self, label):
+        self.busy_var.set(label)
+        for combo in self.__dict__.get("axis_combos", []):
+            combo.configure(state="disabled")
 
     def _safe_start(self, label: str, func: Callable[[], object]) -> bool:
         try:
@@ -1461,113 +1454,19 @@ class XeryonControlGui(tk.Tk):
             self._show_error(str(exc))
             return False
 
-    def _run_command(self, label: str, func: Callable[[], object]) -> None:
-        if self.__dict__.get("start_confirmation") is not None and label != "Disconnect":
-            raise RuntimeError("请先继续或取消待确认的运动。")
-        if label not in ("Disconnect", "Connect", "复核零点"):
-            self._check_reference_ready()
-        if label != "Disconnect" and (self.__dict__.get("close_in_progress", False)
-                                      or self.__dict__.get("disconnect_in_progress", False)):
-            raise RuntimeError("正在停止并断开设备，不能提交新命令。")
-        if self.stop_pending:
-            raise RuntimeError("正在确认停止，请等待。")
-        if self.stop_unconfirmed and label not in ("Disconnect", "Connect"):
-            raise RuntimeError("上次停止未确认，禁止新命令。请确认硬件已停止后断开并重新连接。")
-        shortcut_running = self.__dict__.get("shortcut_active") is not None or bool(self.__dict__.get("shortcut_pending"))
-        if shortcut_running and label != "Disconnect" and not label.startswith("快捷 "):
-            raise RuntimeError("快捷流程进行中：请等待完成，或使用 STOP 停止后再操作。")
-        if self.active_target_inc is not None and label != "Disconnect":
-            raise RuntimeError("运动进行中：请等待到位，或使用 STOP 停止并确认失能后再操作。")
-        if self.command_busy:
-            raise RuntimeError(f"{label} 未提交：另一条命令仍在执行，请等待完成。")
 
-        self.command_busy = True
-        self.busy_var.set(label)
-        # Lock immediately, not on the next 100 ms UI tick.
-        for combo in self.__dict__.get("axis_combos", []):
-            combo.configure(state="disabled")
-        thread = threading.Thread(target=self._command_runner, args=(label, func, self.cancel_generation), daemon=True)
-        thread.start()
-        self._log(f"{label} 已提交后台执行。")
-
-    def _run_stop_command(self, label: str, func: Callable[[], None]) -> None:
+    def _run_stop_command(self, label: str) -> None:
         self._dismiss_start_confirmation()
-        if self.stop_pending:
-            return
-        if self.__dict__.get("close_in_progress") and label != "Close":
-            return
-        if not self.nodes:
-            self.target_status_var.set("未连接设备 · 无法确认停止，请使用硬件停止")
-            return
-        self.stop_verified = False
-        self.stop_pending = True
-        self.cancel_generation += 1
-        self.test_stop_requested.set()
-        self.target_status_var.set("正在停止 · 等待设备确认")
-        self._log(f"{label} requested.")
-        thread = threading.Thread(target=self._stop_runner, args=(label, func), daemon=True)
-        thread.start()
-        self.stop_deadline_seconds = max(3.0, 2.0 + 1.5 * len(self.nodes))
-        self.after(
-            int(self.stop_deadline_seconds * 1000),
-            lambda generation=self.cancel_generation: self._check_stop_deadline(generation),
-        )
+        timeout = self._request_stop(label, notify=self.target_status_var.set)
+        if timeout is not None:
+            generation, seconds = timeout
+            self.after(int(seconds * 1000), lambda: self._check_stop_deadline(generation))
 
     def _check_stop_deadline(self, generation):
-        # USB writes can block below the CAN library. Keep the UI independent
-        # and never let an unreturned transport call look like a successful stop.
-        if self.stop_pending and generation == self.cancel_generation:
-            self.stop_unconfirmed = True
+        if self._stop_timed_out(generation):
             self.target_status_var.set("停止超时未确认 · 请关闭驱动器电源")
-            self._show_error(f"STOP 已请求，但 {self.__dict__.get('stop_deadline_seconds', 3.0):.1f} 秒内未确认停止。请关闭驱动器电源。")
+            self._show_error(f"STOP 已请求，但 {self.stop_deadline_seconds:.1f} 秒内未确认停止。请关闭驱动器电源。")
 
-    def _command_runner(self, label: str, func: Callable[[], object], generation=None) -> None:
-        completion = ("busy", "Idle")
-        try:
-            with self.io_lock:
-                if generation is not None and generation != self.cancel_generation:
-                    raise RuntimeError("命令已被 STOP 取消")
-                if label not in ("Disconnect", "Connect", "复核零点"):
-                    self._check_reference_ready()
-                self._motion_generation = generation
-                result = func()
-            if isinstance(result, StartConfirmation):
-                completion = ("review_start", result)
-            else:
-                self._post("log", f"{label} complete.")
-        except Exception as exc:
-            error_handler(exc)
-            self._post("log", f"{label} failed: {exc}")
-            self._post("error", str(exc))
-        finally:
-            self._post(*completion)
-
-    def _stop_runner(self, label: str, func: Callable[[], None]) -> None:
-        try:
-            # RPDO disable must not wait behind a long-running SDO/command lock.
-            # Each send is serialized with motion writes; cancellation gates all
-            # subsequent enable/setpoint writes, so a worker cannot undo STOP.
-            for node in list(self.nodes.values()):
-                try:
-                    self._write_controlword(node, 0x00)
-                except Exception as exc:
-                    self._post("log", f"Immediate stop send failed: {exc}")
-            if not self.io_lock.acquire(timeout=2.0):
-                raise RuntimeError("通信线程未及时释放，停止状态未确认")
-            try:
-                # Every UI stop route uses the same verified disable path.
-                self._stop_and_disable_worker()
-                self.stop_verified = True
-            finally:
-                self.io_lock.release()
-            self._post("log", f"{label} complete.")
-        except Exception as exc:
-            self.stop_unconfirmed = True
-            self._post("target", "停止未确认 · 请关闭驱动器电源")
-            self._post("log", f"{label} failed: {exc}")
-            self._post("error", f"停止未确认，请关闭驱动器电源。\n{exc}")
-        finally:
-            self.stop_pending = False
 
     # ------------------------------------------------------------------
     # CANopen operations
@@ -1954,75 +1853,6 @@ class XeryonControlGui(tk.Tk):
         target_um = self._inc_to_um(current_inc) + delta_um
         self._move_absolute_worker(target_um, profile, limits)
 
-    def _move_linked_absolute_worker(
-        self,
-        target_um: float,
-        profile: dict[str, float | int],
-        limits: dict[str, float | bool],
-        linked: dict[str, object],
-    ) -> None:
-        self._validate_target(target_um, limits)
-        if bool(limits["enabled"]):
-            self._apply_linked_limits_worker(limits, linked)
-        axes = self._require_linked_axes(linked)
-        starts = {
-            axis: self._read_actual_position_inc(node, fresh=True)
-            for axis, node, _ in axes
-        }
-        targets = self._linked_targets_for_logical_position(target_um, linked)
-        distance_um = max(self._inc_to_um(abs(targets[axis] - starts[axis])) for axis in targets)
-        timeout = self._manual_motion_timeout(distance_um, profile)
-        result = self._run_linked_move(
-            targets,
-            profile,
-            timeout,
-            linked,
-            starts_inc=starts,
-            sync_mode="position",
-            target_label=f"Linked target {target_um:.2f} um",
-        )
-        if result["status"] != "OK":
-            raise RuntimeError(str(result["status"]))
-
-    def _move_linked_relative_worker(
-        self,
-        delta_um: float,
-        profile: dict[str, float | int],
-        limits: dict[str, float | bool],
-        linked: dict[str, object],
-    ) -> None:
-        axes = self._require_linked_axes(linked)
-        starts = {
-            axis: self._read_actual_position_inc(node, fresh=True)
-            for axis, node, _ in axes
-        }
-        delta_inc = self._um_to_inc(delta_um)
-        targets = {
-            axis: starts[axis] + direction * delta_inc
-            for axis, _, direction in axes
-        }
-
-        offsets = dict(linked["offsets"])
-        for axis, _, direction in axes:
-            if axis in offsets:
-                logical_target = direction * self._inc_to_um(targets[axis] - int(offsets[axis]))
-                self._validate_target(logical_target, limits)
-            else:
-                self._validate_target(self._inc_to_um(targets[axis]), limits)
-        if bool(limits["enabled"]) and all(axis in offsets for axis, _, _ in axes):
-            self._apply_linked_limits_worker(limits, linked)
-
-        result = self._run_linked_move(
-            targets,
-            profile,
-            self._manual_motion_timeout(abs(delta_um), profile),
-            linked,
-            starts_inc=starts,
-            sync_mode="travel",
-            target_label=f"Linked relative {delta_um:+.2f} um",
-        )
-        if result["status"] != "OK":
-            raise RuntimeError(str(result["status"]))
 
     @staticmethod
     def _manual_motion_timeout(distance_um: float, profile: dict[str, float | int]) -> float:
@@ -2233,94 +2063,6 @@ class XeryonControlGui(tk.Tk):
 
         self._post("log", "Actuator test complete.")
 
-    def _run_linked_actuator_test_worker(
-        self,
-        test_config: dict[str, object],
-        linked: dict[str, object],
-    ) -> None:
-        speeds = list(test_config["speeds"])
-        distances = list(test_config["distances"])
-        settle_time = float(test_config["settle_time"])
-        step_timeout = float(test_config["step_timeout"])
-        return_after = bool(test_config["return_after"])
-        base_profile = dict(test_config["profile"])
-        axes = self._require_linked_axes(linked)
-        step_no = 1
-        self._post("log", "Starting linked actuator test on A+B.")
-
-        def run_step(speed: float, distance: float, number: int) -> dict[str, object]:
-            profile = dict(base_profile)
-            profile["velocity"] = speed
-            profile["velocity_inc"] = self._um_to_inc(speed)
-            if speed <= 0 or speed > float(profile["max_velocity"]):
-                raise ValueError("双轴测试速度必须大于 0 且不能超过配置的最大速度。")
-            if profile["velocity_inc"] < 1:
-                raise ValueError("双轴测试速度量化后为 0 计数/秒，请提高速度或核对编码器型号。")
-            starts = {
-                axis: self._read_actual_position_inc(node, fresh=True)
-                for axis, node, _ in axes
-            }
-            delta_inc = self._um_to_inc(distance)
-            targets = {
-                axis: starts[axis] + direction * delta_inc
-                for axis, _, direction in axes
-            }
-            offsets = dict(linked["offsets"])
-            for axis, _, direction in axes:
-                if axis in offsets:
-                    logical_target = direction * self._inc_to_um(targets[axis] - int(offsets[axis]))
-                    self._validate_target(logical_target, dict(profile["limits"]))
-                else:
-                    self._validate_target(self._inc_to_um(targets[axis]), dict(profile["limits"]))
-            result = self._run_linked_move(
-                targets,
-                profile,
-                step_timeout,
-                linked,
-                starts_inc=starts,
-                sync_mode="travel",
-                target_label=f"Linked test step {number}",
-            )
-            for axis, values in dict(result["axes"]).items():
-                self._post(
-                    "test_result",
-                    {
-                        "step": number,
-                        "axis": axis,
-                        "speed": speed,
-                        "command": float(values["command"]),
-                        "actual": float(values["actual"]),
-                        "error": float(values["error"]),
-                        "duration": float(result["duration"]),
-                        "status": result["status"],
-                    },
-                )
-            return result
-
-        for speed in speeds:
-            for distance in distances:
-                if self.test_stop_requested.is_set():
-                    self._post("log", "Linked actuator test stopped before next step.")
-                    return
-                result = run_step(float(speed), float(distance), step_no)
-                if result["status"] != "OK":
-                    raise RuntimeError(str(result["status"]))
-                step_no += 1
-                if self.test_stop_requested.wait(settle_time):
-                    return
-
-                if return_after:
-                    if self.test_stop_requested.is_set():
-                        self._post("log", "Linked actuator test stopped before reverse step.")
-                        return
-                    result = run_step(float(speed), -float(distance), step_no)
-                    if result["status"] != "OK":
-                        raise RuntimeError(str(result["status"]))
-                    step_no += 1
-                    if self.test_stop_requested.wait(settle_time):
-                        return
-
-        self._post("log", "Linked actuator test complete.")
 
     def _run_test_move(
         self,
@@ -2493,231 +2235,6 @@ class XeryonControlGui(tk.Tk):
             "samples": samples,
         }
 
-    def _run_linked_move(
-        self,
-        targets_inc: dict[str, int],
-        profile: dict[str, float | int],
-        step_timeout: float,
-        linked: dict[str, object],
-        *,
-        starts_inc: Optional[dict[str, int]] = None,
-        sync_mode: str = "travel",
-        disable_after: bool = True,
-        target_label: str = "Linked move",
-        before_setpoint: Optional[Callable[[], None]] = None,
-    ) -> dict[str, object]:
-        axes = self._require_linked_axes(linked)
-        nodes = [node for _, node, _ in axes]
-        starts = dict(starts_inc or {})
-        for axis, node, _ in axes:
-            starts.setdefault(axis, self._read_actual_position_inc(node, fresh=True))
-            if axis not in targets_inc:
-                raise ValueError(f"Missing linked target for {axis}.")
-
-        currents = dict(starts)
-        statuswords: dict[str, int] = {}
-        best_remaining = {
-            axis: abs(int(targets_inc[axis]) - starts[axis])
-            for axis, _, _ in axes
-        }
-        last_progress = {axis: time.monotonic() for axis, _, _ in axes}
-        progress_samples_by_axis = {axis: [best_remaining[axis]] * 2 for axis, _, _ in axes}
-        mismatch_since: Optional[float] = None
-        status = "OK"
-        start_time = time.monotonic()
-
-        self._validate_linked_targets(targets_inc, linked)
-        self.runtime_position_window_inc = max(1, int(profile.get("position_window_inc", self.__dict__.get("runtime_position_window_inc", 1))))
-        self.active_target_inc = None
-        self.active_start_inc = None
-
-        if bool(dict(profile.get("limits", {})).get("enabled")):
-            self._apply_linked_limits_worker(dict(profile["limits"]), linked)
-        try:
-            for axis, node, _ in axes:
-                self._prepare_profile_position(node, profile, starts[axis])
-            for axis, node, _ in axes:
-                statuswords[axis] = self._read_statusword(node, fresh=True)
-
-            if before_setpoint is not None:
-                before_setpoint()
-            self._command_profile_positions(
-                [(node, int(targets_inc[axis])) for axis, node, _ in axes]
-            )
-            self._post("target", target_label)
-            self._post(
-                "target_start",
-                " / ".join(f"{axis[-1]} {self._inc_to_um(starts[axis]):.2f}" for axis, _, _ in axes),
-            )
-            self._post("target_moved", "A 0.00 / B 0.00")
-            self._post("target_progress", "0.0%")
-
-            deadline = time.monotonic() + step_timeout
-            while time.monotonic() < deadline:
-                if self.test_stop_requested.is_set():
-                    status = "Stopped"
-                    break
-
-                for axis, node, _ in axes:
-                    try:
-                        node.tpdo[3].wait_for_reception(timeout=0.02)
-                    except Exception:
-                        pass
-                    currents[axis] = self._read_actual_position_inc(
-                        node,
-                        fallback=currents[axis],
-                    )
-                    statuswords[axis] = self._read_statusword(
-                        node,
-                        fallback=statuswords[axis],
-                    )
-
-                now = time.monotonic()
-                remaining = {
-                    axis: abs(int(targets_inc[axis]) - currents[axis])
-                    for axis, _, _ in axes
-                }
-                travelled = {
-                    axis: direction * self._inc_to_um(currents[axis] - starts[axis])
-                    for axis, _, direction in axes
-                }
-                totals = {
-                    axis: direction * self._inc_to_um(int(targets_inc[axis]) - starts[axis])
-                    for axis, _, direction in axes
-                }
-                progress = [
-                    100.0 if totals[axis] == 0 else travelled[axis] / totals[axis] * 100.0
-                    for axis, _, _ in axes
-                ]
-                pair_error = self._linked_pair_error_um(
-                    currents,
-                    starts,
-                    linked,
-                    sync_mode,
-                )
-                self._post("target_moved", f"A {travelled['Actuator A']:.2f} / B {travelled['Actuator B']:.2f}")
-                self._post("target_remaining", f"{max(self._inc_to_um(value) for value in remaining.values()):.2f}")
-                self._post("target_progress", f"{max(0.0, min(100.0, min(progress))):.1f}%")
-                self._post("linked_status", self._linked_status_payload(currents, linked, pair_error))
-
-                fault_axis = next(
-                    (axis for axis, _, _ in axes if statuswords[axis] & (BIT(3) | BIT(13))),
-                    None,
-                )
-                if fault_axis is not None:
-                    self._quick_stop_nodes(nodes)
-                    fault = "drive fault" if statuswords[fault_axis] & BIT(3) else "following error"
-                    status = f"{fault_axis} {fault}"
-                    break
-
-                stalled_axis = None
-                for axis, _, _ in axes:
-                    best_remaining[axis], last_progress[axis], stalled = self._update_progress_watchdog(
-                        best_remaining[axis],
-                        self._progress_sample(progress_samples_by_axis[axis], remaining[axis]),
-                        last_progress[axis],
-                        now,
-                        max(1, self._um_to_inc(MOTION_PROGRESS_EPSILON_UM)),
-                        MOTION_STALL_TIMEOUT_SECONDS,
-                    )
-                    if stalled:
-                        stalled_axis = axis
-                        break
-                if stalled_axis is not None:
-                    self._quick_stop_nodes(nodes)
-                    status = f"{stalled_axis} stalled"
-                    break
-
-                if pair_error > float(linked["tolerance_um"]):
-                    mismatch_since = mismatch_since or now
-                    if now - mismatch_since >= PAIR_MISMATCH_TIMEOUT_SECONDS:
-                        self._quick_stop_nodes(nodes)
-                        status = f"Pair mismatch {pair_error:.2f} um"
-                        break
-                else:
-                    mismatch_since = None
-
-                reached = [
-                    bool(statuswords[axis] & BIT(10))
-                    and remaining[axis] <= max(1, self.runtime_position_window_inc)
-                    for axis, _, _ in axes
-                ]
-                if all(reached):
-                    break
-                time.sleep(0.08)
-            else:
-                if self.test_stop_requested.is_set():
-                    status = "Stopped"
-                else:
-                    self._quick_stop_nodes(nodes)
-                    status = "Timeout"
-
-            if self.test_stop_requested.is_set():
-                status = "Stopped"
-            else:
-                for axis, node, _ in axes:
-                    currents[axis] = self._read_actual_position_inc(node, fresh=True)
-                    statuswords[axis] = self._read_statusword(node, fresh=True)
-            if status == "OK":
-                fault_axis = next(
-                    (axis for axis, _, _ in axes if statuswords[axis] & (BIT(3) | BIT(13))),
-                    None,
-                )
-                if fault_axis is not None:
-                    raise RuntimeError(f"{fault_axis} fault during final verification")
-                for axis, _, _ in axes:
-                    remaining = abs(int(targets_inc[axis]) - currents[axis])
-                    if not statuswords[axis] & BIT(10) or remaining > max(1, self.runtime_position_window_inc):
-                        raise RuntimeError(
-                            f"{axis} endpoint not confirmed: remaining {self._inc_to_um(remaining):.2f} um, "
-                            f"status=0x{statuswords[axis]:04X}"
-                        )
-                final_pair_error = self._linked_pair_error_um(currents, starts, linked, sync_mode)
-                if final_pair_error > float(linked["tolerance_um"]):
-                    raise RuntimeError(f"Final pair mismatch {final_pair_error:.2f} um exceeds tolerance")
-        except Exception as exc:
-            status = f"Error: {exc}"
-            if not self.test_stop_requested.is_set():
-                try:
-                    self._quick_stop_nodes(nodes)
-                except Exception:
-                    pass
-        finally:
-            # STOP owns verified cleanup after cancelling this worker. Repeating
-            # multi-axis SDO verification here would keep io_lock from STOP.
-            if not self.test_stop_requested.is_set() and (disable_after or status != "OK"):
-                try:
-                    disabled_result = self._disable_nodes(nodes)
-                    if status == "OK":
-                        for axis, node, _ in axes:
-                            self._verify_disabled_target(node, int(targets_inc[axis]), disabled_result)
-                except Exception as exc:
-                    status = f"{status}; disable error: {exc}"
-
-        pair_error = self._linked_pair_error_um(currents, starts, linked, sync_mode)
-        axis_results = {}
-        for axis, _, direction in axes:
-            command_um = direction * self._inc_to_um(int(targets_inc[axis]) - starts[axis])
-            actual_um = direction * self._inc_to_um(currents[axis] - starts[axis])
-            axis_results[axis] = {
-                "command": command_um,
-                "actual": actual_um,
-                "error": actual_um - command_um,
-            }
-
-        duration = time.monotonic() - start_time
-        self._post("linked_status", self._linked_status_payload(currents, linked, pair_error))
-        self._post("target", f"{target_label}: {status}")
-        self._post(
-            "log",
-            f"{target_label} {status}; mismatch={pair_error:.2f} um, duration={duration:.2f} s.",
-        )
-        return {
-            "status": status,
-            "duration": duration,
-            "pair_error": pair_error,
-            "axes": axis_results,
-        }
 
     def _home_worker(self, direction_positive: bool, offset_um: float, timeout_seconds: float) -> None:
         self._post("clear_user_zero", None)
@@ -2760,26 +2277,6 @@ class XeryonControlGui(tk.Tk):
         self._post("target", "Homed")
         self._post("log", f"Homing complete with offset {offset_um:.2f} um.")
 
-    def _halt_worker(self) -> None:
-        nodes = list(self.nodes.values()) or [self._require_node()]
-        for node in nodes:
-            self._write_controlword(node, 0x0F | BIT(8))
-        if self.active_start_inc is not None:
-            current_inc = self._read_actual_position_inc(self._require_node(), fresh=True)
-            self._update_target_progress(current_inc)
-        self.active_target_inc = None
-        self.active_start_inc = None
-        self._post("target", "Halted")
-
-    def _quick_stop_worker(self) -> None:
-        nodes = list(self.nodes.values()) or [self._require_node()]
-        self._quick_stop_nodes(nodes)
-        if self.active_start_inc is not None:
-            current_inc = self._read_actual_position_inc(self._require_node(), fresh=True)
-            self._update_target_progress(current_inc)
-        self.active_target_inc = None
-        self.active_start_inc = None
-        self._post("target", "Quick stop")
 
     def _enable_drive_worker(self, profile: dict[str, float | int]) -> None:
         linked = self._linked_snapshot()
@@ -2797,74 +2294,6 @@ class XeryonControlGui(tk.Tk):
                 self._disable_drive_worker()
             raise
 
-    def _disable_drive_worker(self, *, only_node=None) -> dict[int, dict[str, int]]:
-        try:
-            nodes = [only_node] if only_node is not None else list(self.nodes.values()) or [self._require_node()]
-            result = self._disable_nodes(nodes)
-            self._record_motion_event("drive_disabled")
-        except Exception as exc:
-            self.stop_unconfirmed = True
-            self._record_motion_event("disable_failed", error=str(exc))
-            self._post("target", "停止未确认 · 请关闭驱动器电源")
-            raise
-        else:
-            self.stop_unconfirmed = False
-            if isinstance(result, dict):
-                for axis, node in self.nodes.items():
-                    if node.id in result:
-                        count = int(result[node.id]["position_inc"])
-                        self.__dict__.setdefault("reference_positions", {})[axis] = count
-                        if axis == self._active_axis_name():
-                            self.last_position_inc = count
-            self._post("target", "已停止 · 已核对失能与位置稳定")
-            return result
-        finally:
-            self.active_target_inc = None
-            self.active_start_inc = None
-
-    def _verify_disabled_target(self, node, target_inc: int, result: object) -> None:
-        if not isinstance(result, dict):
-            return
-        stopped = result.get(node.id)
-        if stopped is None:
-            return
-        remaining = abs(int(stopped["position_inc"]) - int(target_inc))
-        if remaining > max(1, self.runtime_position_window_inc):
-            raise RuntimeError(
-                f"失能后终点偏离目标 {self._inc_to_um(remaining):.2f} µm，"
-                f"status=0x{int(stopped['statusword']):04X}"
-            )
-
-    def _quick_stop_nodes(self, nodes: list[BaseNode402]) -> None:
-        errors = []
-        for node in nodes:
-            try:
-                self._write_controlword(node, 0x0B)
-            except Exception as exc:
-                errors.append(f"node {node.id}: {exc}")
-        if errors:
-            raise RuntimeError("Quick stop failed for " + "; ".join(errors))
-
-    def _disable_nodes(self, nodes: list[BaseNode402]) -> dict[int, dict[str, int]]:
-        errors = []
-        results = {}
-        # Disable every axis before waiting for any individual acknowledgement.
-        for node in nodes:
-            try:
-                self._write_controlword(node, 0x00)
-            except Exception as exc:
-                self._post("log", f"Node {node.id}: RPDO disable failed: {exc}")
-        for node in nodes:
-            try:
-                result = verify_disabled(node)
-                results[node.id] = result
-                self._record_motion_event("stop_verified", node_id=node.id, **result)
-            except Exception as exc:
-                errors.append(f"node {node.id}: {exc}")
-        if errors:
-            self.stop_unconfirmed = True
-            raise RuntimeError("Drive disable failed for " + "; ".join(errors))
-        return results
 
     def _apply_limits_worker(self, limits_config: dict[str, float | bool]) -> None:
         linked = self._linked_snapshot(require_zero=bool(limits_config["enabled"]))
@@ -2886,36 +2315,6 @@ class XeryonControlGui(tk.Tk):
         limits[2].raw = high_inc
         self._post("log", f"Applied runtime limits {min_limit:.2f} to {max_limit:.2f} um.")
 
-    def _apply_linked_limits_worker(
-        self,
-        limits_config: dict[str, float | bool],
-        linked: dict[str, object],
-    ) -> None:
-        axes = self._require_linked_axes(linked)
-        if not bool(limits_config["enabled"]):
-            for _, node, _ in axes:
-                limits = node.sdo["Software position limit"]
-                limits[1].raw = 0
-                limits[2].raw = 0
-            return
-
-        offsets = dict(linked["offsets"])
-        logical_min = float(limits_config["min"])
-        logical_max = float(limits_config["max"])
-        low_inc, high_inc = self._limit_count_bounds(logical_min, logical_max)
-        for axis, node, direction in axes:
-            offset = int(offsets[axis])
-            endpoints = [
-                offset + direction * low_inc,
-                offset + direction * high_inc,
-            ]
-            limits = node.sdo["Software position limit"]
-            limits[1].raw = min(endpoints)
-            limits[2].raw = max(endpoints)
-        self._post(
-            "log",
-            f"Applied linked logical limits {logical_min:.2f} to {logical_max:.2f} um.",
-        )
 
     def _clear_limits_worker(self) -> None:
         linked = self._linked_snapshot()
@@ -3044,18 +2443,6 @@ class XeryonControlGui(tk.Tk):
             time.sleep(0.05)
         raise RuntimeError(f"Node {node.id}: state transition was not confirmed")
 
-    def _check_motion_cancelled(self):
-        self._check_reference_ready()
-        generation = self.__dict__.get("_motion_generation")
-        if ((generation is not None and generation != self.cancel_generation)
-                or self.test_stop_requested.is_set() or self.__dict__.get("stop_unconfirmed", False)):
-            raise RuntimeError("运动已取消或停止状态未确认")
-
-    def _reset_motion_cancel(self):
-        self._check_reference_ready()
-        if self.stop_pending or self.stop_unconfirmed:
-            raise RuntimeError("停止处理中或停止状态未确认，不能开始运动")
-        self.test_stop_requested.clear()
 
     def _write_profile(self, node: BaseNode402, profile: dict[str, float | int]) -> None:
         velocity = float(profile["velocity"])
@@ -3090,17 +2477,6 @@ class XeryonControlGui(tk.Tk):
             ),
         )
 
-    def _write_controlword(self, node: BaseNode402, value: int) -> None:
-        with self.controlword_lock:
-            if value & 0x04 and value & 0x08:
-                self._check_motion_cancelled()
-            set_controlword(node, value)
-
-    def _write_target_position(self, node: BaseNode402, value: int) -> None:
-        with self.controlword_lock:
-            self._check_motion_cancelled()
-            set_target_position(node, value)
-
     def _command_profile_position(self, node: BaseNode402, target_inc: int) -> None:
         self._command_profile_positions([(node, target_inc)])
 
@@ -3130,294 +2506,12 @@ class XeryonControlGui(tk.Tk):
     # Status and validation
     # ------------------------------------------------------------------
     def _poll_status(self) -> None:
-        if (self.node is not None and not self.status_busy and not self.command_busy
-                and not self.stop_pending and not self.stop_unconfirmed
-                and time.monotonic() >= self.__dict__.get("next_status_poll_time", 0.0)
-                and not self.__dict__.get("close_in_progress", False)
-                and not self.__dict__.get("disconnect_in_progress", False)):
-            self.status_busy = True
-            thread = threading.Thread(target=self._status_worker, daemon=True)
-            thread.start()
+        start_poll_if_due(self)
         self.after(POLL_INTERVAL_MS, self._poll_status)
 
     def _status_worker(self) -> None:
-        try:
-            with self.io_lock:
-                feedback_axis = self._active_axis_name()
-                node = self.nodes.get(feedback_axis, self.node)
-                if node is None:
-                    return
-                self.node = node
+        poll_feedback(self, rest_seconds=STATUS_POLL_REST_SECONDS)
 
-                # A recently received PDO can still repeat an old position.
-                # While idle, display the result of a new 0x6064 upload each poll.
-                idle = self.active_target_inc is None
-                if not idle:
-                    try:
-                        node.tpdo[3].wait_for_reception(timeout=0.05)
-                    except Exception:
-                        pass
-
-                position_inc = self._read_actual_position_inc(node, fresh=idle)
-                sample_time = time.monotonic()
-                statusword = self._read_statusword(node)
-                state = str(getattr(node, "state", "-"))
-                mode = self._read_mode(node)
-                self.last_position_inc = position_inc
-                self.last_statusword = statusword
-
-                status = {
-                    "axis": feedback_axis,
-                    "sample_time": sample_time,
-                    "position_um": self._inc_to_um(position_inc),
-                    "position_inc": position_inc,
-                    "statusword": statusword,
-                    "state": state,
-                    "mode": mode,
-                }
-
-                sample_positions = {feedback_axis: position_inc}
-                if "Actuator A" in self.nodes and "Actuator B" in self.nodes:
-                    linked = {
-                        "enabled": True,
-                        "invert_b": bool(self.__dict__.get("invert_b_enabled", False)),
-                        "tolerance_um": 0.0,
-                        "offsets": dict(self.linked_zero_offsets_inc),
-                    }
-                    pair_currents = {
-                        axis: position_inc if pair_node is node else self._read_actual_position_inc(pair_node, fresh=idle)
-                        for axis, pair_node, _ in self._require_linked_axes(linked)
-                    }
-                    sample_positions = pair_currents
-                    self._post("linked_status", self._linked_status_payload(pair_currents, linked))
-
-                if self.active_target_inc is None and self.__dict__.get("shortcut_wait_deadline") is not None:
-                    step = self.__dict__.get("shortcut_active")
-                    if step is not None:
-                        expected = self._um_to_inc(float(step["target"]))
-                        window = max(1, self.runtime_position_window_inc)
-                        if statusword & (BIT(3) | BIT(13)) or abs(position_inc - expected) > window:
-                            current = self._read_actual_position_inc(node, fresh=True)
-                            live_status = self._read_statusword(node, fresh=True)
-                            if live_status & (BIT(3) | BIT(13)) or abs(current - expected) > window:
-                                self.test_stop_requested.set()
-                                self._disable_drive_worker()
-                                reason = "停留期间驱动故障或位置偏离，已取消后续步骤"
-                                self._post("target", reason)
-                                self._post("log", reason)
-                                self._post_shortcut_failure(reason)
-
-                if self.active_target_inc is not None:
-                    now = time.monotonic()
-                    if self.active_start_inc is not None:
-                        self._update_target_progress(position_inc)
-
-                    remaining_inc = abs(position_inc - self.active_target_inc)
-                    software_stall = False
-                    candidate_best = self.active_best_remaining_inc
-                    candidate_last = self.active_last_progress_time
-                    progress_samples = self.__dict__.setdefault('active_progress_samples', [])
-                    progress_remaining = self._progress_sample(progress_samples, remaining_inc)
-                    if self.active_best_remaining_inc is not None:
-                        (
-                            candidate_best,
-                            candidate_last,
-                            software_stall,
-                        ) = self._update_progress_watchdog(
-                            self.active_best_remaining_inc,
-                            progress_remaining,
-                            self.active_last_progress_time,
-                            now,
-                            max(1, self._um_to_inc(MOTION_PROGRESS_EPSILON_UM)),
-                            MOTION_STALL_TIMEOUT_SECONDS,
-                        )
-
-                    target_window = self.runtime_position_window_inc
-                    target_reached = bool(statusword & BIT(10))
-                    close_enough = remaining_inc <= max(1, target_window)
-                    overshot = self._target_overshot(position_inc)
-                    if overshot or software_stall or (target_reached and close_enough) or statusword & (BIT(3) | BIT(13)):
-                        # Verify a terminal decision against the live device, never only a PDO cache.
-                        position_inc = self._read_actual_position_inc(node, fresh=True)
-                        statusword = self._read_statusword(node, fresh=True)
-                        now = time.monotonic()
-                        remaining_inc = abs(position_inc - self.active_target_inc)
-                        (candidate_best, candidate_last,
-                         software_stall) = self._update_progress_watchdog(
-                            self.active_best_remaining_inc,
-                            self._progress_sample(progress_samples, remaining_inc, replace_last=True),
-                            self.active_last_progress_time, now,
-                            max(1, self._um_to_inc(MOTION_PROGRESS_EPSILON_UM)),
-                            MOTION_STALL_TIMEOUT_SECONDS,
-                        )
-                        target_reached = bool(statusword & BIT(10))
-                        close_enough = remaining_inc <= max(1, target_window)
-                        overshot = self._target_overshot(position_inc)
-                        self.last_position_inc = position_inc
-                        self._update_target_progress(position_inc)
-                        status.update(position_um=self._inc_to_um(position_inc), position_inc=position_inc, statusword=statusword,
-                                      sample_time=now)
-                        self._record_motion_event("live_verification", position_inc=position_inc,
-                                                  statusword=statusword, stalled=software_stall)
-
-                    self.active_best_remaining_inc = candidate_best
-                    self.active_last_progress_time = candidate_last
-                    self._record_motion_event("sample", position_inc=position_inc, statusword=statusword,
-                                              remaining_inc=self.active_target_inc - position_inc)
-                    if statusword & (BIT(3) | BIT(13)):
-                        reason = "驱动故障" if statusword & BIT(3) else "跟随误差保护"
-                        self._record_motion_event("stop", reason=reason, position_inc=position_inc,
-                                                  statusword=statusword)
-                        self._disable_drive_worker()
-                        self._post("target", reason)
-                        self._post("log", f"{reason}，运动已停止并失能；status=0x{statusword:04X}。")
-                        self._post_shortcut_failure(reason)
-                    elif overshot:
-                        self._record_motion_event("stop", reason="passed_target", position_inc=position_inc,
-                                                  target_inc=self.active_target_inc, statusword=statusword)
-                        self._disable_drive_worker()
-                        self._post("target", "越过目标保护 · 序列已中止")
-                        self._post("log", "实时读数已越过目标且超出到位窗口，已停止并失能；请检查控制器轨迹。")
-                        self._post_shortcut_failure("越过目标保护")
-                    elif target_reached and close_enough and (now - self.active_target_time) > 0.1:
-                        reached_um = self._inc_to_um(position_inc)
-                        self._record_motion_event("target_reached", position_inc=position_inc,
-                                                  statusword=statusword)
-                        target_inc = self.active_target_inc
-                        disabled_result = self._disable_drive_worker()
-                        self._verify_disabled_target(node, target_inc, disabled_result)
-                        self._post("single_axis_target", ("已到达", reached_um))
-                        self._post("target_remaining", "0.00")
-                        self._post("target_progress", "100.0%")
-                        self._post("log", f"Target reached at {reached_um:.2f} um.")
-                        generation = self._shortcut_generation_token()
-                        if generation is not None:
-                            self._post("shortcut_done", generation)
-                    elif software_stall:
-                        remaining_um = self._inc_to_um(self.active_target_inc - position_inc)
-                        self._record_motion_event("stop", reason="no_progress_live_confirmed",
-                                                  position_inc=position_inc, statusword=statusword,
-                                                  remaining_um=remaining_um)
-                        self._disable_drive_worker()
-                        self._post("target", "无进展保护（已实时复核）")
-                        self._post(
-                            "log",
-                            f"Motion halted after {MOTION_STALL_TIMEOUT_SECONDS:.0f} s without target progress; "
-                            f"remaining {remaining_um:.2f} um; live SDO confirmed, position "
-                            f"{self._inc_to_um(position_inc):.2f} um, status 0x{statusword:04X}.",
-                        )
-                        self._post_shortcut_failure("无进展保护")
-                    elif now >= self.active_target_deadline:
-                        self._record_motion_event("stop", reason="timeout", position_inc=position_inc)
-                        self._disable_drive_worker()
-                        self._post("target", "Motion timeout")
-                        self._post("log", "Motion halted and disabled: target timeout.")
-                        self._post_shortcut_failure("运动超时")
-                    else:
-                        # Capture BEFORE any halt resets the controller's demand position.
-                        # Terminal decisions above never wait for these additional reads.
-                        self._record_controller_snapshot(node)
-
-                self.reference_positions = sample_positions
-                self._post("connection_health", True)
-                self._post("status", status)
-        except Exception as exc:
-            self._post("log", f"Status read failed: {exc}")
-            if self.__dict__.get("reference_review") is None:
-                self.reference_review = dict(self.__dict__.get("reference_positions", {}))
-            self.cancel_generation = self.__dict__.get("cancel_generation", 0) + 1
-            self._post("feedback_stale", None)
-            self._post("connection_health", False)
-            with self.io_lock:
-                self._record_motion_event("communication_fault", error=str(exc))
-                self.test_stop_requested.set()
-                stop_errors = []
-                try:
-                    self._disable_nodes(list(self.nodes.values()))
-                except Exception as stop_exc:
-                    stop_errors.append(str(stop_exc))
-                self.stop_unconfirmed = bool(stop_errors)
-                self.active_target_inc = None
-                self.active_start_inc = None
-                message = "通信异常：已请求停止并失能" if not stop_errors else "通信异常：停止状态未确认，请使用硬件停止"
-                self._record_motion_event("communication_stop", confirmed=not stop_errors, errors=stop_errors)
-                self._post("target", message)
-                self._post("log", message)
-                self._post("error", message)
-                self._post_shortcut_failure(message)
-        finally:
-            # Reserve a real idle window after I/O, even when a read takes longer
-            # than the poll timer. This prevents status traffic starving commands.
-            self.next_status_poll_time = time.monotonic() + STATUS_POLL_REST_SECONDS
-            self.status_busy = False
-
-    def _update_target_progress(self, position_inc: int) -> None:
-        if self.active_start_inc is None or self.active_target_inc is None:
-            return
-
-        moved_um = self._inc_to_um(position_inc - self.active_start_inc)
-        remaining_um = self._inc_to_um(self.active_target_inc - position_inc)
-        total_inc = self.active_target_inc - self.active_start_inc
-
-        if total_inc:
-            progress = ((position_inc - self.active_start_inc) / total_inc) * 100.0
-            progress = max(0.0, min(100.0, progress))
-        else:
-            progress = 100.0
-
-        self._post("target_moved", f"{moved_um:.2f}")
-        self._post("target_remaining", f"{remaining_um:.2f}")
-        self._post("target_progress", f"{progress:.1f}%")
-
-    def _target_overshot(self, position_inc: int) -> bool:
-        if self.active_target_inc is None or self.active_start_inc is None:
-            return False
-        distance = self.active_target_inc - self.active_start_inc
-        if not distance:
-            return False
-        direction = 1 if distance > 0 else -1
-        return direction * (position_inc - self.active_target_inc) > max(1, self.runtime_position_window_inc)
-
-    def _read_actual_position_inc(
-        self, node: BaseNode402, fresh: bool = False, fallback: Optional[int] = None
-    ) -> int:
-        if not fresh:
-            try:
-                tpdo = node.tpdo[3]
-                if self._pdo_is_fresh(tpdo):
-                    return int(tpdo["Position Actual Value"].raw)
-            except Exception:
-                pass
-            # Never substitute a previous position when feedback has expired.
-        return self._read_feedback_sdo(node, "Position Actual Value")
-
-    def _read_statusword(
-        self, node: BaseNode402, fresh: bool = False, fallback: Optional[int] = None
-    ) -> int:
-        if not fresh:
-            try:
-                tpdo = node.tpdo[3]
-                if self._pdo_is_fresh(tpdo):
-                    return int(tpdo["Statusword"].raw)
-            except Exception:
-                pass
-        return self._read_feedback_sdo(node, "Statusword")
-
-    def _read_feedback_sdo(self, node, name):
-        try:
-            return int(node.sdo[name].raw)
-        except Exception:
-            if self.__dict__.get("command_busy") and self.__dict__.get("reference_review") is None:
-                self.reference_review = dict(self.__dict__.get("reference_positions", {}))
-                self.test_stop_requested.set()
-                self._post("command_feedback_fault", node)
-            raise
-
-    @staticmethod
-    def _pdo_is_fresh(tpdo) -> bool:
-        # python-can/slcan timestamps are wall-clock seconds, not monotonic time.
-        timestamp = tpdo.timestamp
-        return timestamp is not None and 0 <= time.time() - timestamp <= PDO_MAX_AGE_SECONDS
 
     def _start_motion_trace(self, node, start_inc, target_inc, profile) -> None:
         self.controller_trace_next_time = 0.0
@@ -3432,45 +2526,6 @@ class XeryonControlGui(tk.Tk):
             self.motion_trace_path = None
             self._post("log", f"无法保存轨迹：{exc}")
 
-    def _record_controller_snapshot(self, node) -> None:
-        now = time.monotonic()
-        if self.motion_trace_path is None or now < self.controller_trace_next_time:
-            return
-        self.controller_trace_next_time = now + CONTROLLER_TRACE_INTERVAL_SECONDS
-        values = {"read_started_monotonic_s": now, "host_target_inc": self.active_target_inc}
-        fields = (("demand_inc", 0x6062), ("actual_inc", 0x6064),
-                  ("following_error_inc", 0x60F4), ("target_inc", 0x607A),
-                  ("error_register", 0x1001), ("manufacturer_status", 0x1002))
-        # Bound additional bus occupancy; never retry indefinitely or hide a lost link.
-        timeout, retries = node.sdo.RESPONSE_TIMEOUT, node.sdo.MAX_RETRIES
-        try:
-            node.sdo.MAX_RETRIES = 1
-            for name, index in fields:
-                if self.test_stop_requested.is_set():
-                    values["interrupted_by_stop"] = True
-                    break
-                if index in self.controller_trace_unsupported:
-                    continue
-                budget = 0.5 - (time.monotonic() - now)
-                if budget <= 0:
-                    values["read_budget_exhausted"] = True
-                    break
-                node.sdo.RESPONSE_TIMEOUT = min(timeout, 0.25, budget)
-                try:
-                    values[name] = int(node.sdo[index].raw)
-                except SdoAbortedError as exc:
-                    # Unsupported firmware objects are explicit missing evidence.
-                    if exc.code not in (0x06020000, 0x06090011):
-                        raise
-                    self.controller_trace_unsupported.add(index)
-                    values[name + "_unavailable"] = str(exc)
-        except Exception as exc:
-            values["read_error"] = str(exc)
-            raise  # Existing communication-fault handling stops and disables the drive.
-        finally:
-            node.sdo.RESPONSE_TIMEOUT, node.sdo.MAX_RETRIES = timeout, retries
-            values["read_finished_monotonic_s"] = time.monotonic()
-            self._record_motion_event("controller_snapshot", **values)
 
     def _record_motion_event(self, event: str, **values) -> None:
         if self.motion_trace_path is None:
@@ -3481,45 +2536,6 @@ class XeryonControlGui(tk.Tk):
             self.motion_trace_path = None
             self._post("log", f"轨迹写入失败：{exc}")
 
-    def _read_mode(self, node: BaseNode402) -> str:
-        try:
-            mode_value = int(node.sdo["Modes of Operation Display"].raw)
-        except Exception:
-            try:
-                mode_value = int(node.sdo[0x6061].raw)
-            except Exception:
-                return "-"
-
-        for mode in NodeOperationMode:
-            if mode.value == mode_value:
-                return mode.name
-        return str(mode_value)
-
-    @staticmethod
-    def _update_progress_watchdog(
-        best_remaining_inc: int,
-        remaining_inc: int,
-        last_progress_time: float,
-        now: float,
-        min_progress_inc: int,
-        stall_timeout: float,
-    ) -> tuple[int, float, bool]:
-        if remaining_inc <= best_remaining_inc - min_progress_inc:
-            return remaining_inc, now, False
-        return best_remaining_inc, last_progress_time, now - last_progress_time >= stall_timeout
-
-    @staticmethod
-    def _progress_sample(history, remaining_inc, replace_last=False):
-        # Filter only progress history. Arrival, overshoot, faults and limits
-        # continue to use the unfiltered live position/status immediately.
-        # One forward spike must not set an unreachable all-time best that
-        # falsely stops a still-moving slow trajectory ten seconds later.
-        if replace_last and history:
-            history[-1] = remaining_inc
-        else:
-            history.append(remaining_inc)
-        del history[:-3]
-        return sorted(history)[len(history) // 2]
 
     def _active_axis_name(self) -> str:
         axis = self.__dict__.get("active_axis")
@@ -3590,159 +2606,6 @@ class XeryonControlGui(tk.Tk):
                 f"({min_limit:.2f} to {max_limit:.2f} um)."
             )
 
-    def _linked_snapshot(self, require_zero: bool = False) -> dict[str, object]:
-        enabled = self._linked_mode_enabled()
-        invert_b = self.__dict__.get("invert_b_enabled")
-        if invert_b is None:
-            invert_b = bool(self.invert_b_var.get())
-        snapshot: dict[str, object] = {
-            "enabled": enabled,
-            "invert_b": invert_b,
-            "tolerance_um": 0.0,
-            "offsets": dict(self.linked_zero_offsets_inc),
-        }
-        if not enabled:
-            return snapshot
-
-        tolerance = self.__dict__.get("pair_tolerance_um")
-        if tolerance is None:
-            tolerance = self._parse_positive_float(self.pair_tolerance_var, "maximum A/B mismatch")
-        if not isfinite(tolerance) or tolerance <= 0:
-            raise ValueError("双轴最大位置差必须为大于 0 的有限数值。")
-        snapshot["tolerance_um"] = tolerance
-
-        missing = [axis for axis in ("Actuator A", "Actuator B") if axis not in self.nodes]
-        if missing:
-            raise RuntimeError("A+B linked mode requires both Actuator A and Actuator B to be connected.")
-        if require_zero and any(axis not in self.linked_zero_offsets_inc for axis in self.nodes):
-            raise RuntimeError("Set Pair Zero before linked absolute moves or the Standard Cycle.")
-        return snapshot
-
-    def _require_linked_axes(
-        self,
-        linked: dict[str, object],
-    ) -> list[tuple[str, BaseNode402, int]]:
-        if not bool(linked["enabled"]):
-            raise RuntimeError("A+B linked mode is not enabled.")
-        try:
-            node_a = self.nodes["Actuator A"]
-            node_b = self.nodes["Actuator B"]
-        except KeyError as exc:
-            raise RuntimeError("A+B linked mode requires two connected actuators.") from exc
-        return [
-            ("Actuator A", node_a, 1),
-            ("Actuator B", node_b, -1 if bool(linked["invert_b"]) else 1),
-        ]
-
-    def _set_linked_zero_worker(self) -> None:
-        linked = self._linked_snapshot()
-        axes = self._require_linked_axes(linked)
-        positions = {
-            axis: self._read_actual_position_inc(node, fresh=True)
-            for axis, node, _ in axes
-        }
-        self.linked_zero_offsets_inc = positions
-        linked["offsets"] = dict(positions)
-        self._post("pair_zero_status", "Pair zero set")
-        self._post("linked_status", self._linked_status_payload(positions, linked, 0.0))
-        self._post(
-            "log",
-            "Linked software zero captured for A and B. Device home offsets were not changed.",
-        )
-
-    def _invalidate_linked_zero(self, reason: str) -> None:
-        if not self.__dict__.get("linked_zero_offsets_inc", {}):
-            return
-        self.linked_zero_offsets_inc = {}
-        self._post("pair_zero_status", "Not set")
-        self._post("log", f"Linked software zero cleared after {reason}.")
-
-    def _validate_linked_targets(self, targets_inc: dict[str, int], linked: dict[str, object]) -> None:
-        for axis, _, _ in self._require_linked_axes(linked):
-            travel = self.travel_ranges.get(axis)
-            if travel is None or not travel.confirmed:
-                raise ValueError(f"双轴 {axis} 缺少有效的机械行程映射，已拒绝联动目标。")
-            target_inc = int(targets_inc[axis])
-            travel.validate(
-                self._inc_to_um(target_inc),
-                target_inc,
-                self._inc_to_um(1),
-                axis,
-            )
-
-    def _linked_targets_for_logical_position(
-        self,
-        target_um: float,
-        linked: dict[str, object],
-    ) -> dict[str, int]:
-        offsets = dict(linked["offsets"])
-        target_inc = self._um_to_inc(target_um)
-        return {
-            axis: int(offsets[axis]) + direction * target_inc
-            for axis, _, direction in self._require_linked_axes(linked)
-        }
-
-    def _read_linked_logical_positions(
-        self,
-        linked: dict[str, object],
-        *,
-        fresh: bool = False,
-    ) -> dict[str, float]:
-        offsets = dict(linked["offsets"])
-        return {
-            axis: direction
-            * self._inc_to_um(self._read_actual_position_inc(node, fresh=fresh) - int(offsets[axis]))
-            for axis, node, direction in self._require_linked_axes(linked)
-        }
-
-    def _linked_pair_error_um(
-        self,
-        currents: dict[str, int],
-        starts: dict[str, int],
-        linked: dict[str, object],
-        sync_mode: str,
-    ) -> float:
-        axes = self._require_linked_axes(linked)
-        if sync_mode == "position":
-            offsets = dict(linked["offsets"])
-            values = {
-                axis: direction * self._inc_to_um(currents[axis] - int(offsets[axis]))
-                for axis, _, direction in axes
-            }
-        else:
-            values = {
-                axis: direction * self._inc_to_um(currents[axis] - starts[axis])
-                for axis, _, direction in axes
-            }
-        return abs(values["Actuator A"] - values["Actuator B"])
-
-    def _linked_status_payload(
-        self,
-        currents: dict[str, int],
-        linked: dict[str, object],
-        pair_error: Optional[float] = None,
-    ) -> dict[str, object]:
-        axes = self._require_linked_axes(linked)
-        offsets = dict(linked["offsets"])
-        if all(axis in offsets for axis, _, _ in axes):
-            positions = {
-                axis: direction * self._inc_to_um(currents[axis] - int(offsets[axis]))
-                for axis, _, direction in axes
-            }
-        else:
-            positions = {
-                axis: self._inc_to_um(currents[axis])
-                for axis, _, _ in axes
-            }
-        return {
-            "position_a": positions["Actuator A"],
-            "position_b": positions["Actuator B"],
-            "pair_error": (
-                abs(positions["Actuator A"] - positions["Actuator B"])
-                if pair_error is None and all(axis in offsets for axis, _, _ in axes)
-                else pair_error
-            ),
-        }
 
     def _connection_snapshot(self) -> dict[str, object]:
         snapshot = {
@@ -4460,7 +3323,7 @@ class XeryonControlGui(tk.Tk):
             return
         if self.nodes and not self.close_stop_requested and not self.close_cleanup_started:
             self.close_stop_requested = True
-            self._run_stop_command("Close", self._stop_and_disable_worker)
+            self._run_stop_command("Close")
 
         busy = self.stop_pending or self.command_busy or self.__dict__.get("status_busy", False)
         if not busy and (self.stop_unconfirmed or (self.close_stop_requested and not self.stop_verified)):

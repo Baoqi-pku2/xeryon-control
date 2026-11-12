@@ -44,11 +44,11 @@ class Release28SafetyTests(unittest.TestCase):
             app.stop_pending = True
             app.cancel_generation += 1
             app.test_stop_requested.set()
-            stopper = threading.Thread(target=app._stop_runner, args=("STOP", Mock()))
+            stopper = threading.Thread(target=app._stop_runner, args=("STOP",))
             stopper.start()
             return 0x27
         app._read_statusword = Mock(side_effect=request_stop)
-        with patch("xeryon_control.ui.main_window.verify_disabled", wraps=verify_disabled) as verified:
+        with patch("xeryon_control.application.stop.verify_disabled", wraps=verify_disabled) as verified:
             with app.io_lock:
                 result = app._run_test_move(app.node, "Actuator A", 1, 5, 10,
                     {"max_velocity": 100, "limits": {"enabled": False}}, 1)
@@ -114,7 +114,7 @@ class Release28SafetyTests(unittest.TestCase):
             app = make_app()
             setattr(app, flag, True)
             app.busy_var = Mock()
-            with patch("xeryon_control.ui.main_window.threading.Thread") as thread:
+            with patch("xeryon_control.application.commands.threading.Thread") as thread:
                 with self.assertRaises(RuntimeError):
                     app._run_command("Move absolute", Mock())
                 thread.assert_not_called()
@@ -124,7 +124,7 @@ class Release28SafetyTests(unittest.TestCase):
         app.node = NS(id=33)
         app.status_busy = False
         app.close_in_progress = True
-        with patch("xeryon_control.ui.main_window.threading.Thread") as thread:
+        with patch("xeryon_control.application.feedback.threading.Thread") as thread:
             app._poll_status()
             thread.assert_not_called()
         app.after.assert_called_once()

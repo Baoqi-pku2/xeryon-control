@@ -23,13 +23,23 @@
 | 包内路径 | 职责 |
 | --- | --- |
 | `domain/` | 坐标换算、各轴零点、机械行程和分段规划，可直接脱离 Tk 和设备测试 |
-| `application/` | 端点采样流程、起点变化确认数据、重复定位流程 |
+| `application/commands.py` | 普通命令准入、后台执行、取消代次，以及带取消检查的设备写入 |
+| `application/feedback.py` | 轮询节流、SDO/PDO 反馈、目标进度、到位与异常复核 |
+| `application/linked_motion.py` | 双轴零点、方向与限位换算、同步推进及两轴偏差监测 |
+| `application/stop.py` | 独立 STOP 线程、逐轴失能、停稳确认与超时状态 |
+| `application/calibration.py`、`motion.py`、`repeatability.py` | 端点采样、起点变化确认数据、重复定位流程 |
 | `hardware/` | CANopen 配置与读写、驱动状态判断、设定点握手及停稳确认 |
-| `ui/` | Tk 控件、弹窗和主窗口；主窗口仍协调后台命令、反馈和 STOP |
+| `ui/` | Tk 控件、弹窗、定时回调和后台事件展示。主窗口将应用层组件组合在同一设备会话上 |
 | `reporting/` | 结果目录与运动轨迹 JSONL 格式 |
 | `resources/eds/` | 随包发布的 EDS 及对象字典说明 |
 
 离线测试在 `tests/`。从根目录运行 `.\project_uv.cmd run --locked python -m unittest discover -s tests`。厂家示例和实机通信脚本保留在 `examples/`。
+
+### 验证等待设备回复时的 STOP
+
+运行 `.\project_uv.cmd run --locked python -m unittest -v tests.test_stop_interrupt`。测试让普通命令持有会话 I/O 锁并等待模拟编码器的 SDO 回复。STOP 先取消旧命令，使用独立线程向两个轴发送失能帧，再取得 I/O 锁，逐轴核验状态字和位置稳定性。
+
+测试分别释放和持续阻塞回复。前者要求两轴停稳后才报告成功；后者要求锁等待超时后保留“停止未确认”并阻止再次启动。两种情况下，旧命令都不能在迟到的回复之后写入目标或重新使能。测试使用模拟传输，实机停止延迟需现场测量。
 
 ## 打包一致性检查
 
