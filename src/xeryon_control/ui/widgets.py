@@ -122,7 +122,7 @@ class PresetButton(QPushButton):
 
 def edit(field):
     widget = QLineEdit(str(field.get()))
-    widget.textEdited.connect(field.set)
+    widget.textEdited.connect(field.set_from_user)
 
     def update():
         text = str(field.get())
@@ -195,7 +195,7 @@ def combo(field, choices, editable=False):
     widget.setEditable(editable)
     widget.addItems(list(choices))
     widget.setCurrentText(str(field.get()))
-    widget.currentTextChanged.connect(field.set)
+    widget.currentTextChanged.connect(field.set_from_user)
 
     def update():
         with QSignalBlocker(widget):
@@ -244,7 +244,7 @@ def check(text, field, changed=None):
     widget.setChecked(bool(field.get()))
 
     def toggle(value):
-        field.set(value)
+        field.set_from_user(value)
         if changed:
             changed()
 

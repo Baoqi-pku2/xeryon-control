@@ -38,6 +38,8 @@ uv run python -m xeryon_control
 
 环境已同步时，也可直接运行 `.\.venv\Scripts\python.exe -m xeryon_control`。
 
+界面会自动保存手动修改的连接参数、运动参数、分段流程、快捷停留时间和测试设置。源码版和 Windows EXE 共用 `%LOCALAPPDATA%\XeryonControl\settings.ini`。下次启动会恢复表单值；应用到设备仍通过原有连接和操作流程完成。用户零点、行程确认、待执行目标和快捷队列仅在当前会话有效。
+
 主窗口按当前显示器的可用区域居中。宽屏双栏显示位置与运动，窄屏顺序排列并可滚动；顶部停止按钮始终可达。
 
 连接前核对实际串口、CAN 波特率、节点和编码器型号。源码默认 `slcan / COM3 / 125 kbit/s / Node 32 / ENC_RES_1MU`，主推进器使用厂家默认节点 32。不要将软件显示的默认行程视为已测得的机械端点。配置入口及常见故障见 [开发与调试](docs/DEVELOPMENT.md)。

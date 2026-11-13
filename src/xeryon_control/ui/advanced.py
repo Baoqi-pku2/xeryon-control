@@ -283,7 +283,7 @@ class AdvancedPages(QTabWidget):
             )
         )
         profile = page("运动参数", "settings")
-        form = group(profile, "运动参数（仅本次运行）", "settings", 0)
+        form = group(profile, "运动参数", "settings", 0)
         fields(
             form,
             [

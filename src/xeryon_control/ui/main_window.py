@@ -20,6 +20,7 @@ from xeryon_control.config import EDS_PATH
 from xeryon_control.ui.advanced import AdvancedPages
 from xeryon_control.ui.icons import icon
 from xeryon_control.ui.position_panel import PositionPanel
+from xeryon_control.ui.preferences import Preferences, preferences_path
 from xeryon_control.ui.travel_readout import TravelReadout
 from xeryon_control.ui.theme import apply_theme
 from xeryon_control.ui.widgets import (
@@ -39,9 +40,12 @@ from xeryon_control.ui.widgets import (
 class MainWindow(QMainWindow):
     finished = Signal()
 
-    def __init__(self, session=None):
+    def __init__(self, session=None, *, settings_file=None):
         super().__init__()
         self.session = s = session if session is not None else ControllerSession()
+        self.preferences = None
+        if settings_file is not None:
+            self.preferences = Preferences(s, settings_file, self, lambda message: s._post("log", message))
         self.setWindowTitle("Xeryon 电极推进器控制台")
         self._allow_close = False
         self._timers = set()
@@ -362,6 +366,8 @@ class MainWindow(QMainWindow):
         if self._allow_close:
             return
         self._allow_close = True
+        if self.preferences is not None:
+            self.preferences.flush()
         for timer in tuple(self._timers):
             self.cancel_timer(timer)
         QApplication.instance().removeEventFilter(self)
@@ -369,17 +375,19 @@ class MainWindow(QMainWindow):
         self.finished.emit()
 
 
-def create_desktop():
+def create_desktop(*, settings_file=None):
     app = QApplication.instance() or QApplication(sys.argv)
     app.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[1] / "resources" / "xeryon-control.ico")))
     apply_theme(app)
-    window = MainWindow()
+    window = MainWindow(settings_file=settings_file)
+    if window.preferences is not None:
+        app.aboutToQuit.connect(window.preferences.flush)
     window.finished.connect(app.quit)
     return app, window
 
 
 def main():
-    app, window = create_desktop()
+    app, window = create_desktop(settings_file=preferences_path())
     window.show()
     if "--smoke-test" in sys.argv:
         app.processEvents()

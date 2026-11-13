@@ -142,7 +142,7 @@ class PositionPanel(QWidget):
         self.speeds = {}
         for name, speed in (("慢速", 5), ("中速", 20), ("快速", 50), ("高速", 300)):
             b = button(
-                f"{name}  {speed}", lambda n=speed: m.speed.set(str(n)), "segment"
+                f"{name}  {speed}", lambda n=speed: m.speed.set_from_user(str(n)), "segment"
             )
             b.setCheckable(True)
             self.speeds[speed] = b
