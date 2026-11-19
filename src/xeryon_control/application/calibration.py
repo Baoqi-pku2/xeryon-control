@@ -1,4 +1,4 @@
-"""Capture an endpoint across the disabled, enabled and settled samples."""
+"""Capture a stationary encoder position across the disabled, enabled and settled samples."""
 import time
 
 

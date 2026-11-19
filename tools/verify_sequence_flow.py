@@ -38,7 +38,6 @@ def run(output, dwell=30.0):
         app.node = node
         origin_um = app._inc_to_um(node.position)
         app.position_panel.apply_user_zero(origin_um, time.monotonic())
-        app.position_panel.apply_travel()  # Exercise the previously failing precheck.
         app.shortcut_dwell_var.set(str(dwell))
         original_done = app._handle_shortcut_done
 
@@ -72,7 +71,14 @@ def run(output, dwell=30.0):
                     for i, step in enumerate(report["completed_steps"][:-1])
                     if i+1 < len(node.commands)]
                 expected = [app._um_to_inc(origin_um + preset[2]) for preset in SHORTCUT_PRESETS]
+                report["monitor_runs"] = len(window.monitor.runs)
+                report["monitored_segments"] = [
+                    segment.name for segment, curves in window.monitor.series.items()
+                    if curves.curves[0].bounds is not None
+                ]
                 report["passed"] = (done and not failed and report["start_clicks"] == 1
+                    and report["monitor_runs"] == 1
+                    and report["monitored_segments"] == [f"快捷 {n} {name}" for n, name, _, _ in SHORTCUT_PRESETS]
                     and [cmd["target_inc"] for cmd in node.commands] == expected
                     and all(step["disabled"] for step in report["completed_steps"])
                     and len(report["inter_step_intervals_s"]) == 6

@@ -33,6 +33,9 @@ def poll_feedback(session, *, rest_seconds) -> None:
         with session.io_lock:
             _sample_and_supervise(session)
     except Exception as exc:
+        capture = session.__dict__.get("motion_capture")
+        if capture is not None:
+            capture.finish()
         session._post("log", f"Status read failed: {exc}")
         if session.__dict__.get("reference_review") is None:
             session.reference_review = dict(session.__dict__.get("reference_positions", {}))
@@ -293,7 +296,11 @@ class FeedbackMonitoring:
             except Exception:
                 pass
             # Never substitute a previous position when feedback has expired.
-        return self._read_feedback_sdo(node, "Position Actual Value")
+        count = self._read_feedback_sdo(node, "Position Actual Value")
+        capture = self.__dict__.get("motion_capture")
+        if capture is not None:
+            capture.on_sdo(node, count, time.monotonic())
+        return count
 
     def _read_statusword(
         self, node: BaseNode402, fresh: bool = False, fallback: Optional[int] = None

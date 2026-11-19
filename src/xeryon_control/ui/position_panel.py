@@ -1,12 +1,14 @@
 """Main console, using the same controller fields as the advanced pages."""
 
 from math import isfinite
-from PySide6.QtCore import Qt, QSignalBlocker
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QSlider
+from PySide6.QtCore import Qt, QSignalBlocker, QLocale
+from PySide6.QtGui import QDoubleValidator, QValidator
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QSlider, QLineEdit
+from xeryon_control.application.position import CONSOLE_SPAN_UM, CONSOLE_TARGET_HINT, valid_console_coordinate
 from xeryon_control.domain.shortcut_presets import SHORTCUT_PRESETS
 from xeryon_control.domain.travel import MODEL
 from xeryon_control.ui.icons import icon
-from xeryon_control.ui.travel_readout import PositionSummary
+from xeryon_control.ui.position_summary import PositionSummary
 from xeryon_control.ui.plot import PositionPlot
 from xeryon_control.ui.widgets import (
     label,
@@ -29,6 +31,30 @@ def signed_readout(text):
     )
 
 
+class ConsoleTargetValidator(QDoubleValidator):
+    def fixup(self, text):
+        return ""
+
+    def validate(self, text, pos):
+        state, text, pos = super().validate(text, pos)
+        # Keep the whole invalid draft visible. Dropping the last digit of
+        # 20000 would silently turn the operator's request into 2000.
+        try:
+            numeric = float(text)
+        except ValueError:
+            numeric = None
+        if text == "-" or (numeric is not None and isfinite(numeric) and not valid_console_coordinate(text)):
+            state = QValidator.State.Intermediate
+        return state, text, pos
+
+
+class ConsoleTargetEdit(QLineEdit):
+    def focusOutEvent(self, event):
+        if not self.hasAcceptableInput():
+            self.clear()
+        super().focusOutEvent(event)
+
+
 class PositionPanel(QWidget):
     def __init__(self, session):
         super().__init__()
@@ -42,7 +68,7 @@ class PositionPanel(QWidget):
         connect, bar = card()
         self.port = combo(s.channel_var, s.serial_ports, True)
         self.connect_button = button("连接设备", self.toggle_connection, "connect")
-        self.zero_button = button("收回端点置零", self.zero)
+        self.zero_button = button("当前位置置零", self.zero)
         self.port.setMinimumWidth(90)
         self.refresh_button = button("刷新", s.refresh_device, "quiet")
         self.refresh_button.setIcon(icon("refresh"))
@@ -90,7 +116,6 @@ class PositionPanel(QWidget):
                 divider(True),
                 label(MODEL, "muted"),
                 None,
-                button("行程检查", s.view.show_motion_setup, "quiet"),
                 segments(self.full, self.zoom),
             )
         )
@@ -107,7 +132,19 @@ class PositionPanel(QWidget):
         form.addWidget(value_label(m.zero_text, "muted", True))
         form.addStretch(1)
         form.addWidget(divider())
-        self.entry = edit(m.user_target)
+        self.editing_target = False
+        self.entry = ConsoleTargetEdit()
+        validator = ConsoleTargetValidator(0, CONSOLE_SPAN_UM, -1, self.entry)
+        locale = QLocale.c()
+        locale.setNumberOptions(QLocale.NumberOption.RejectGroupSeparator)
+        validator.setLocale(locale)
+        validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self.entry.setValidator(validator)
+        self.entry.setPlaceholderText("0–13000")
+        self.entry.setToolTip(CONSOLE_TARGET_HINT)
+        self.entry.textEdited.connect(self.edit_target)
+        m.user_target.subscribe(self.sync_target_entry)
+        self.sync_target_entry()
         self.entry.setObjectName("targetInput")
         self.entry.setMaximumWidth(200)
         form.addLayout(
@@ -126,6 +163,7 @@ class PositionPanel(QWidget):
         )
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 10000)
+        self.slider.setToolTip("滑块目标范围：50–13000 µm（相对用户零点）")
         self.slider.valueChanged.connect(self.slider_changed)
         form.addWidget(self.slider)
         form.addLayout(
@@ -240,8 +278,21 @@ class PositionPanel(QWidget):
             self.session.set_current_user_zero()
 
     def slider_changed(self, n):
-        lo, hi = self.model.target_bounds()
+        lo, hi = self.model.slider_bounds()
         self.model.slide_target(lo + (hi - lo) * n / 10000)
+
+    def edit_target(self, text):
+        self.editing_target = True
+        try:
+            self.model.user_target.set_from_user(text if self.entry.hasAcceptableInput() else "")
+        finally:
+            self.editing_target = False
+
+    def sync_target_entry(self):
+        text = str(self.model.user_target.get())
+        shown = text if valid_console_coordinate(text) else ""
+        if not self.editing_target and self.entry.text() != shown:
+            self.entry.setText(shown)
 
     def refresh(self):
         s, m = self.session, self.model
@@ -258,9 +309,11 @@ class PositionPanel(QWidget):
             w.setEnabled(not locked)
         self.start.setEnabled(
             not (locked or s.reference_review is not None or s.reconnect_reason)
+            and (bool(s.shortcut_selected) or
+                 (self.entry.hasAcceptableInput() and valid_console_coordinate(m.user_target.get())))
         )
         self.zero_button.setText(
-            "复核零点" if s.reference_review is not None else "收回端点置零"
+            "复核零点" if s.reference_review is not None else "当前位置置零"
         )
         self.zero_button.setEnabled(
             bool(
@@ -306,7 +359,7 @@ class PositionPanel(QWidget):
                 "撤到工作起点", self.workflow_start, SHORTCUT_PRESETS[4][3]
             )
         self.clear.setEnabled(bool(s.shortcut_selected and not locked))
-        lo, hi = m.target_bounds()
+        lo, hi = m.slider_bounds()
         try:
             value = float(m.target.get())
         except ValueError:

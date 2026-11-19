@@ -6,26 +6,10 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 from xeryon_control.application.session import ControllerSession as Gui
-from xeryon_control.domain.travel import TravelRange
 from tests.test_feedback import make_app
 
 
 class SequenceGeometryTests(unittest.TestCase):
-    def test_fifty_um_from_401_real_encoder_origins(self):
-        resolution = 1.0079
-        for origin in range(-200, 201):
-            with self.subTest(origin=origin):
-                zero = origin * resolution
-                travel = TravelRange()
-                travel.confirm(zero + 30000, 50, "A")
-                requested = zero + 50
-                count = round(requested / resolution)
-                travel.validate(requested, count, resolution, "A")
-                self.assertAlmostEqual(count * resolution - zero, 50.395, places=8)
-                with self.assertRaises(ValueError):
-                    travel.validate(requested - 0.001, count, resolution, "A")
-                with self.assertRaises(ValueError):
-                    travel.validate(requested, count - 1, resolution, "A")
 
     def test_live_overshoot_cancels_sequence_before_stall_timeout(self):
         app, node, pdo = make_app(position=120)
@@ -148,11 +132,6 @@ class SequenceDwellTests(unittest.TestCase):
         self.app.command_busy = False
         self.app._continue_shortcut_after_dwell(generation)
         self.assertEqual(self.app._safe_start.call_count, 2)
-
-    def test_position_precheck_accepts_real_retracted_endpoint(self):
-        self.app.position_panel.apply_travel()
-        self.app._show_error.assert_not_called()
-        self.assertTrue(self.app.travel_range.confirmed)
 
     def test_invalid_dwell_rejected_before_any_motion(self):
         for value in ("", "-1", "nan", "inf", "100000"):

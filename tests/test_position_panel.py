@@ -2,13 +2,12 @@
 import time
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
 import unittest
 from tests.qt_support import create_console
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from xeryon_control.ui.travel_readout import TravelReadout
 from tools.simulated_node import SimulatedNode
 
 
@@ -22,8 +21,6 @@ class PositionPanelTests(unittest.TestCase):
         self.node = SimpleNamespace(id=32)
         self.app.node = self.node
         self.app.nodes = {"Actuator A": self.node}
-        self.app.default_limit_var.set(False)
-        self.app.travel_range.confirm(0, 1000, "Actuator A")
         self.app._safe_start = Mock()
         self.feedback(100)
 
@@ -49,12 +46,27 @@ class PositionPanelTests(unittest.TestCase):
 
     def test_slider_entry_and_keyboard_stay_synchronized(self):
         self.ui.slider.setValue(5200)
-        lo,hi=self.panel.target_bounds()
+        lo,hi=self.panel.slider_bounds()
         self.assertAlmostEqual(float(self.panel.target.get()),lo+.52*(hi-lo),places=2)
         self.panel.target.set("250")
         self.assertEqual(self.ui.slider.value(),round(10000*(250-lo)/(hi-lo)))
         QTest.keyClick(self.ui.plot,Qt.Key.Key_Down)
         self.assertAlmostEqual(float(self.panel.target.get()),250+self.app._inc_to_um(1),places=2)
+
+    def test_slider_home_keeps_fifty_um_margin_after_zero_change(self):
+        for zero in (-37000, 100):
+            with self.subTest(zero=zero):
+                self.panel.apply_user_zero(zero, time.monotonic())
+                # Synchronizing an explicitly entered zero must not edit it.
+                self.panel.user_target.set("0")
+                self.assertEqual(float(self.panel.target.get()), zero)
+                self.assertEqual(self.ui.slider.value(), 0)
+                QTest.keyClick(self.ui.slider, Qt.Key.Key_End)
+                QTest.keyClick(self.ui.slider, Qt.Key.Key_Home)
+                self.assertEqual(float(self.panel.user_target.get()), 50)
+                self.assertEqual(float(self.panel.target.get()), zero + 50)
+                self.assertEqual(self.panel.display_bounds(), (zero, zero + 13000))
+        self.app._safe_start.assert_not_called()
 
     @patch("time.monotonic", new=lambda: 1000.0)
     def test_speed_buttons_reach_profile_and_start_uses_snapshot(self):
@@ -292,30 +304,28 @@ class PositionPanelTests(unittest.TestCase):
     def test_shift_from_zero_explains_how_to_recapture_the_endpoint(self):
         self._setup_shifted_start(zero=-18000, initial_offset=0)
         labels = [w.text() for w in self.window.confirmation.findChildren(QLabel)]
-        self.assertTrue(any("收回端点置零" in label for label in labels))
+        self.assertTrue(any("当前位置置零" in label for label in labels))
         self.app._dismiss_start_confirmation()
         self.assertEqual(self.panel.user_zero_um, -18000)
         self.app._command_profile_position.assert_not_called()
 
     def test_full_stroke_and_zoom_do_not_change_slider_or_limits(self):
         self.panel.show_full_travel()
-        self.assertEqual((self.panel.view_min, self.panel.view_max), (-30000, 30000))
+        self.assertEqual((self.panel.view_min, self.panel.view_max), (0, 13000))
         self.panel.target.set("800")
         limits = self.app._limits_snapshot()
-        before = self.panel.target_bounds()
+        before = self.panel.display_bounds()
         self.panel.span.set("100")
         self.panel.center_view()
-        self.assertEqual(self.panel.target_bounds(), before)
+        self.assertEqual(self.panel.display_bounds(), before)
         self.assertEqual(self.panel.target.get(), "800")
         self.assertEqual(self.app._limits_snapshot(), limits)
         self.assertEqual((self.panel.view_min, self.panel.view_max), (50, 150))
-        self.assertEqual(self.app.travel_range.command_bounds, (-29000, 29000))
 
-    def test_mapping_required_and_cannot_target_reserved_end_zone(self):
+    def test_console_range_check_does_not_require_endpoint_mapping(self):
         self.panel.target.set("30000")
         self.panel.start()
         self.app._safe_start.assert_not_called()
-        self.app.travel_range.invalidate()
         self.panel.target.set("200")
         self.panel.redraw()
         self.assertTrue(self.ui.start.isEnabled())
@@ -323,7 +333,6 @@ class PositionPanelTests(unittest.TestCase):
         self.assertTrue(self.panel.target.get())
 
     def test_unmapped_positions_are_visible_and_preview_does_not_move(self):
-        self.app.travel_range.invalidate()
         self.feedback(-24975.76)
         self.panel.show_full_travel()
         self.assertTrue(self.panel.position is not None and self.panel.is_fresh())
@@ -336,7 +345,7 @@ class PositionPanelTests(unittest.TestCase):
         self.panel.center_view()
         self.assertTrue(self.panel.position is not None and self.panel.is_fresh())
         self.assertTrue(self.panel.target.get())
-        self.assertTrue(self.ui.start.isEnabled())
+        self.assertFalse(self.ui.start.isEnabled())
         self.app._safe_start.assert_not_called()
 
     def test_first_feedback_does_not_fake_physical_midpoint(self):
@@ -345,9 +354,9 @@ class PositionPanelTests(unittest.TestCase):
         self.feedback(-24975.762)
         self.panel.show_full_travel()
         self.assertEqual(self.panel.encoder_view_center, 0.0)
-        self.assertEqual(self.panel.display_bounds(), (-30000, 30000))
+        self.assertEqual(self.panel.display_bounds(), (0, 13000))
         top, bottom = self.ui.plot.y_for(self.panel.view_min), self.ui.plot.y_for(self.panel.view_max)
-        expected_y = top + (-24975.762 + 30000) / 60000 * (bottom - top)
+        expected_y = top + -24975.762 / 13000 * (bottom - top)
         actual = self.ui.plot.y_for(self.panel.position)
         self.assertAlmostEqual(actual, expected_y)
         self.assertLess(actual, (top + bottom) / 2)
@@ -386,39 +395,6 @@ class PositionPanelTests(unittest.TestCase):
         self.assertEqual(len(self.ui.presets),7)
         self.assertGreater(self.ui.presets[7].y(),self.ui.presets[1].y())
 
-    def test_motion_setup_uses_current_position_without_switching_pages(self):
-        self.window.show_motion_setup()
-        self.assertFalse(self.window.setup_dialog.isModal())
-        self.panel.use_current_position_as_center()
-        self.assertEqual(float(self.panel.center_coordinate.get()),100)
-        self.assertTrue(self.panel.center_checked.get())
-        next(b for b in self.window.setup_dialog.findChildren(QPushButton) if b.text()=="确认行程映射").click()
-        self.assertFalse(self.window.setup_dialog.isVisible())
-        self.assertEqual(self.window.stack.currentIndex(),0)
-        self.app._safe_start.assert_not_called()
-
-    def test_applying_mapping_does_not_move_or_rezero_device(self):
-        self.panel.center_coordinate.set("50")
-        self.panel.end_margin.set("2000")
-        self.assertFalse(self.app.travel_range.confirmed)
-        self.panel.center_checked.set(True)
-        self.panel.apply_travel()
-        self.assertTrue(self.app.travel_range.confirmed)
-        self.assertEqual(self.app.travel_range.mechanical_bounds, (-29950, 30050))
-        self.assertEqual(self.app.travel_range.command_bounds, (-27950, 28050))
-        self.assertEqual(self.app._limits_snapshot(), {"enabled":False,"min":-27950,"max":28050})
-        self.assertEqual(self.panel.position, 100)
-        self.app._safe_start.assert_not_called()
-        self.panel.invalidate()
-        self.assertFalse(self.app.travel_range.confirmed)
-
-    def test_work_limits_cannot_expand_confirmed_stroke(self):
-        self.app.limit_enabled_var.set(True)
-        self.app.max_limit_var.set("50000")
-        with self.assertRaises(ValueError):
-            self.app._limits_snapshot()
-        self.app.max_limit_var.set("20000")
-        self.assertEqual(self.app._limits_snapshot()["max"], 20000)
 
     def test_stop_failure_blocks_start_despite_fresh_position(self):
         self.app.stop_unconfirmed = True
@@ -472,10 +448,6 @@ class PositionPanelTests(unittest.TestCase):
         self.assertEqual(self.app.user_position_var.get(), "0.00")
         self.assertEqual(self.panel.user_target.get(), "0.00")
         self.assertEqual(float(self.app.target_position_var.get()), 100)
-        self.assertEqual(self.app.travel_range.center_um, 30100)
-        self.assertEqual(self.app.travel_range.command_bounds, (150, 60050))
-        self.assertEqual(self.app._limits_snapshot(), {"enabled": False, "min": 150, "max": 60050})
-        self.assertTrue(self.app.travel_range.confirmed)
         self.app._safe_start.assert_not_called()
         self.feedback(110)
         self.assertEqual(self.panel.actual_text.get(), "10.00")
@@ -487,9 +459,9 @@ class PositionPanelTests(unittest.TestCase):
             operation()
         self.assertEqual(move.call_args.args[0],2600)
 
-    def test_zero_preserves_mechanical_limits_and_disconnect_clears_offset(self):
+    def test_console_range_survives_zero_and_disconnect_clears_offset(self):
         self.panel.apply_user_zero(100, time.monotonic())
-        self.panel.user_target.set("60000")  # raw 60100 exceeds the 59000 command limit
+        self.panel.user_target.set("60000")  # outside the console input range
         self.panel.start()
         self.app._safe_start.assert_not_called()
         self.panel.invalidate()
@@ -499,7 +471,7 @@ class PositionPanelTests(unittest.TestCase):
     def test_disabled_feedback_tracks_manual_adjustment_with_same_zero_and_target(self):
         self.panel.apply_user_zero(8000, time.monotonic())
         self.panel.user_target.set("6000")
-        limits = self.app.travel_range.command_bounds
+        limits = self.app._limits_snapshot()
         for raw, shown in ((13000, "5000.00"), (13200, "5200.00")):
             count = self.app._um_to_inc(raw)
             self.feedback(raw, position_inc=count, statusword=0x1250, state="SWITCH ON DISABLED")
@@ -507,7 +479,7 @@ class PositionPanelTests(unittest.TestCase):
             self.assertIn(f"{count} 计数", self.panel.encoder_caption.get())
             self.assertEqual(self.panel.user_zero_um, 8000)
             self.assertEqual(float(self.panel.target.get()), 14000)
-        self.assertEqual(self.app.travel_range.command_bounds, limits)
+        self.assertEqual(self.app._limits_snapshot(), limits)
         self.app._safe_start.assert_not_called()
 
     def test_zero_button_rejects_already_enabled_drive(self):
@@ -521,7 +493,7 @@ class PositionPanelTests(unittest.TestCase):
 
     def test_zero_result_applies_only_until_a_stop_request(self):
         payload = {"node": self.node, "axis": "Actuator A", "generation": self.app.cancel_generation,
-                   "raw_um": -37000, "sample_time": time.monotonic()}
+                   "raw_um": -37000, "coordinate": 0.0, "sample_time": time.monotonic()}
         self.app._handle_ui_event("user_zero", payload)
         self.assertEqual(self.panel.user_zero_um, -37000)
         self.app.cancel_generation += 1
@@ -552,87 +524,83 @@ class PositionPanelTests(unittest.TestCase):
         self.assertIsNone(app.start_confirmation)
         self.assertEqual([cmd["target_inc"] for cmd in node.commands], [-35900 + app._um_to_inc(3350)])
 
-    def test_endpoint_table_distinguishes_stale_feedback_from_missing_calibration(self):
-        self.panel.apply_user_zero(100, time.monotonic())
-        self.panel.received_at -= 10
-        self.panel.redraw()
-        table = self.window.advanced.findChild(TravelReadout)
-        self.assertEqual([w.text() for w in table.endpoint_values], ["0.000", "60.000"])
-        self.assertEqual([w.text() for w in table.distance_values], ["—", "—"])
-        self.assertEqual([w.text() for w in self.ui.summary.distances], ["—", "—"])
-        self.app.travel_range.invalidate()
-        self.panel.redraw()
-        self.assertEqual([w.text() for w in table.endpoint_values], ["—", "—"])
-        self.assertEqual(table.coordinate.text(), "待标定")
 
-    def test_endpoint_zero_places_body_at_top_and_derives_range(self):
-        self.app.default_limit_var.set(True)
-        self.app.travel_range.invalidate()
+    def test_user_zero_places_body_at_top_without_commanding_motion(self):
         self.panel.apply_user_zero(100, time.monotonic())
-        self.assertEqual(self.panel.display_bounds(), (100, 15100))
-        self.app.default_limit_var.set(False)
         self.panel.show_full_travel()
-        self.assertEqual(self.panel.display_bounds(), (100, 60100))
-        display = self.window.advanced.findChild(TravelReadout)
-        self.assertEqual([w.text() for w in display.endpoint_values], ["0.000", "60.000"])
-        self.assertEqual([w.text() for w in display.distance_values], ["0.000", "60.000"])
+        self.assertEqual(self.panel.display_bounds(), (100, 13100))
         before=self.ui.plot.y_for(self.panel.position)
         self.assertEqual(before,self.ui.plot.y_for(self.panel.view_min))
         self.panel.preview_fraction(1.0)
-        high_inc = self.app.travel_range.count_bounds(self.app._inc_to_um(1))[1]
-        self.assertAlmostEqual(float(self.panel.user_target.get()), self.app._inc_to_um(high_inc) - 100, places=2)
+        self.assertEqual(float(self.panel.user_target.get()), 13000)
         self.assertEqual(self.ui.plot.y_for(self.panel.position), before)
-        self.assertTrue(self.app.travel_range.confirmed)
         self.assertTrue(self.ui.start.isEnabled())
         self.app._safe_start.assert_not_called()
 
-    def test_default_limit_is_selected_and_enforced_before_motion(self):
-        self.app.default_limit_var.set(True)
-        self.assertTrue(self.app.default_limit_var.get())
-        self.app.travel_range.invalidate()
+    def test_console_rejects_out_of_range_draft_and_advanced_accepts_it(self):
         self.panel.apply_user_zero(100, time.monotonic())
-        self.assertEqual(self.panel.display_bounds(), (100, 15100))
-        self.app._validate_target(13100, {"enabled": False, "min": 150, "max": 60050})
-        for target in (13100.4, 14000, 20000):
-            with self.assertRaisesRegex(ValueError, "默认限位"):
-                self.app._validate_target(target, {"enabled": False, "min": 150, "max": 60050})
-        self.app.default_limit_var.set(False)
-        self.app._validate_target(20000, {"enabled": False, "min": 150, "max": 60050})
-        self.panel.show_full_travel()
-        self.assertEqual(self.panel.display_bounds(), (100, 60100))
+        self.assertEqual(self.panel.display_bounds(), (100, 13100))
+        self.ui.entry.selectAll()
+        QTest.keyClicks(self.ui.entry, "20000")
+        self.assertFalse(self.ui.entry.hasAcceptableInput())
+        self.assertFalse(self.ui.start.isEnabled())
+        self.assertEqual(self.panel.target.get(), "")
+        self.app._submit_panel_move = Mock()
+        self.ui.start.click()
+        self.app._submit_panel_move.assert_not_called()
+        advanced_input = next(w for w in self.window.advanced.findChildren(QLineEdit)
+                              if w.accessibleName() == "目标位置 (µm)")
+        QTest.keyClicks(advanced_input, "20000")
+        self.assertEqual(self.ui.entry.text(), "")
+        self.assertFalse(self.ui.start.isEnabled())
+        self.panel.start()
+        self.app._submit_panel_move.assert_not_called()
+        self.app._show_error.reset_mock()
+        next(b for b in self.window.advanced.findChildren(QPushButton) if b.text() == "移动到目标位置").click()
+        self.app._show_error.assert_not_called()
+        worker = self.app._safe_start.call_args.args[1]
+        with patch.object(self.app, "_move_absolute_worker") as move:
+            worker()
+        self.assertEqual(move.call_args.args[0], 20100)
 
-    def test_default_limit_toggle_clamps_target_and_restores_full_view(self):
-        self.app.travel_range.invalidate()
-        self.panel.apply_user_zero(100, time.monotonic())
-        self.app.default_limit_var.set(False)
-        self.panel.user_target.set("14000")
-        self.app.default_limit_var.set(True)
-        self.panel.default_limit_changed()
-        self.assertLessEqual(float(self.panel.user_target.get()), 13000)
-        self.assertEqual(self.panel.display_bounds(), (100, 15100))
+    def test_console_target_entry_slider_and_start_use_display_range(self):
+        self.app.origins.capture("Actuator A", 100)
+        self.panel.show_full_travel()
+        self.ui.entry.selectAll()
+        QTest.keyClicks(self.ui.entry, "-1000")
+        self.assertFalse(self.ui.entry.hasAcceptableInput())
+        self.assertEqual(self.panel.target.get(), "")
+        self.app._submit_panel_move = Mock()
+        self.ui.start.click()
+        self.app._show_error.assert_not_called()
+        self.app._submit_panel_move.assert_not_called()
+        low, high = self.panel.display_bounds()
+        self.assertEqual((low, high), (100, 13100))
+        self.ui.slider.setValue(10000)
+        self.assertAlmostEqual(float(self.panel.target.get()), high, places=2)
+        self.ui.start.click()
+        self.assertEqual(self.app._submit_panel_move.call_args.args[1], high)
+        self.ui.slider.setValue(0)
+        self.assertAlmostEqual(float(self.panel.target.get()), low + 50, places=2)
+        self.ui.start.click()
+        self.assertEqual(self.app._submit_panel_move.call_args.args[1], low + 50)
         self.panel.span.set("60000")
         self.panel.center_view()
-        self.assertEqual((self.panel.view_min, self.panel.view_max), (100, 15100))
-        self.app.default_limit_var.set(False)
-        self.panel.default_limit_changed()
-        self.assertEqual(self.panel.display_bounds(), (100, 60100))
+        self.assertEqual((self.panel.view_min, self.panel.view_max), (low, high))
         self.app._safe_start.assert_not_called()
 
-    def test_photo_view_can_zoom_negative_feedback_without_clipping_or_rezeroing(self):
-        self.app.travel_range.invalidate()
+    def test_zoom_stays_in_console_range_while_negative_feedback_remains_visible_in_readout(self):
         self.panel.apply_user_zero(100, time.monotonic())
-        self.app.travel_range.invalidate()
         self.feedback(50)
         self.panel.span.set("1000")
         self.panel.center_view()
-        self.assertEqual((self.panel.view_min, self.panel.view_max), (-450, 550))
+        self.assertEqual((self.panel.view_min, self.panel.view_max), (100, 1100))
         self.assertEqual(self.panel.actual_text.get(), "-50.00")
         self.assertEqual(self.panel.user_zero_um, 100)
         top, bottom = self.ui.plot.y_for(self.panel.view_min), self.ui.plot.y_for(self.panel.view_max)
         self.ui.plot.preview((top+bottom)/2)
-        self.assertEqual(float(self.panel.target.get()), 50)
-        self.assertEqual(float(self.panel.user_target.get()), -50)
-        self.assertFalse(self.app.travel_range.confirmed)
+        self.assertEqual(float(self.panel.target.get()), 600)
+        self.assertEqual(float(self.panel.user_target.get()), 500)
         self.app._safe_start.assert_not_called()
     def test_switching_back_restores_zero_and_review_survives_new_feedback(self):
         self.panel.apply_user_zero(8000, time.monotonic())
@@ -641,7 +609,6 @@ class PositionPanelTests(unittest.TestCase):
         self.panel.apply_user_zero(3000, time.monotonic())
         self.app.active_axis_var.set("Actuator A")
         self.assertEqual(self.panel.user_zero_um, 8000)
-        self.assertEqual(self.panel.center_coordinate.get(), "38000.0000")
         self.feedback(19000)
         self.app._update_workflow_preview()
         self.assertIn("慢速 11000.0 → 13000", self.app.workflow_preview_var.get())
@@ -652,17 +619,6 @@ class PositionPanelTests(unittest.TestCase):
         self.assertEqual(self.ui.zero_button.text(), "复核零点")
         with self.assertRaisesRegex(RuntimeError, "待复核"):
             self.app._check_reference_ready()
-
-    def test_axis_switch_preserves_each_axis_mechanical_mapping(self):
-        from xeryon_control.domain.travel import TravelRange
-        travel_a = TravelRange()
-        travel_a.confirm(30000, 50, "Actuator A")
-        travel_b = TravelRange()
-        travel_b.confirm(40000, 50, "Actuator B")
-        self.app.travel_ranges = {"Actuator A": travel_a, "Actuator B": travel_b}
-        self.app.active_axis_var.set("Actuator B")
-        self.assertEqual(self.app.travel_ranges, {"Actuator A": travel_a, "Actuator B": travel_b})
-        self.assertIs(self.app.travel_range, travel_b)
 
 
 if __name__ == "__main__":

@@ -73,16 +73,16 @@ class ControllerLifecycleTests(unittest.TestCase):
         self.assertIn("not confirmed", report["shutdown_verification"])
         self.assertNotIn("final_statusword", report)
 
-    def test_disabling_default_limit_cannot_bypass_mechanical_reference(self):
+    def test_targets_need_no_mechanical_mapping_but_must_fit_device_counts(self):
         app = make_app()
-        app.default_limit_enabled = False
-        with self.assertRaisesRegex(ValueError, "行程|置零"):
-            app._validate_target(100000, {"enabled": False})
+        for target in (-100000, 0, 100000):
+            app._validate_target(target, {"enabled": False})
+        for target in (float('nan'), float('inf'), -2**31 - 1, 2**31):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                app._validate_target(target, {"enabled": False})
 
     def test_custom_limits_reject_quantized_target_outside_interval(self):
         app = make_app()
-        app.default_limit_enabled = False
-        app.travel_range.confirm(0, 50, "Actuator A")
         # Requested 100.8 is inside, but its actual command is 101 counts.
         with self.assertRaises(ValueError):
             app._validate_target(100.8, {"enabled": True, "min": 0, "max": 100.8})

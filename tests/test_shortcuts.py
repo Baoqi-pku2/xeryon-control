@@ -175,7 +175,6 @@ class ShortcutTests(unittest.TestCase):
             self.assertEqual(self.app.shortcut_active["user_target"], 50)
             self.assertEqual(self.app.shortcut_active["speed"], 300)
             self.app._cancel_shortcut_queue()
-        self.assertEqual(self.app.travel_range.command_bounds, (150, 60050))
 
     def test_clear_selection_never_starts_or_clears_active_motion(self):
         for number in (1, 2, 3):

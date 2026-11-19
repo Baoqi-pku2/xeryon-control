@@ -66,6 +66,9 @@ class StopCoordinator:
             self._post("log", f"{label} failed: {exc}")
             self._post("error", f"停止未确认，请关闭驱动器电源。\n{exc}")
         finally:
+            capture = self.__dict__.get("motion_capture")
+            if capture is not None:
+                capture.finish()
             self.stop_pending = False
 
     def _stop_and_disable_worker(self) -> None:
@@ -86,6 +89,9 @@ class StopCoordinator:
         else:
             self.stop_unconfirmed = False
             if isinstance(result, dict):
+                recovery = self.__dict__.get("zero_recovery")
+                if recovery is not None:
+                    recovery.capture_stopped(result)
                 for axis, node in self.nodes.items():
                     if node.id in result:
                         count = int(result[node.id]["position_inc"])
@@ -95,6 +101,9 @@ class StopCoordinator:
             self._post("target", "已停止。驱动已关闭，位置稳定")
             return result
         finally:
+            capture = self.__dict__.get("motion_capture")
+            if capture is not None:
+                capture.finish(only_node)
             self.active_target_inc = None
             self.active_start_inc = None
 
@@ -134,6 +143,9 @@ class StopCoordinator:
             try:
                 result = verify_disabled(node)
                 results[node.id] = result
+                capture = self.__dict__.get("motion_capture")
+                if capture is not None:
+                    capture.stopped_position(node, result["position_inc"])
                 self._record_motion_event("stop_verified", node_id=node.id, **result)
             except Exception as exc:
                 errors.append(f"node {node.id}: {exc}")

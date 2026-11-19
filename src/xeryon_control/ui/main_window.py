@@ -10,7 +10,10 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
+    QGridLayout,
     QMainWindow,
+    QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -19,17 +22,15 @@ from xeryon_control.application.session import ControllerSession, POLL_INTERVAL_
 from xeryon_control.config import EDS_PATH
 from xeryon_control.ui.advanced import AdvancedPages
 from xeryon_control.ui.icons import icon
+from xeryon_control.ui.motion_monitor import MonitorPage
 from xeryon_control.ui.position_panel import PositionPanel
 from xeryon_control.ui.preferences import Preferences, preferences_path
-from xeryon_control.ui.travel_readout import TravelReadout
 from xeryon_control.ui.theme import apply_theme
 from xeryon_control.ui.widgets import (
     button,
     divider,
     glyph,
     card,
-    check,
-    edit,
     label,
     row,
     scroll,
@@ -50,7 +51,6 @@ class MainWindow(QMainWindow):
         self._allow_close = False
         self._timers = set()
         self.error_dialog = self.confirmation = self.close_notice = None
-        self.setup_dialog = None
         self.session.view = self
         root = QWidget()
         root.setObjectName("root")
@@ -63,35 +63,55 @@ class MainWindow(QMainWindow):
         hl.setContentsMargins(16, 5, 14, 5)
         self.stack = QStackedWidget()
         self.console_tab = button("控制台", lambda: self.select_page(0), "nav")
-        self.advanced_tab = button("高级设置", lambda: self.select_page(1), "nav")
-        for b in (self.console_tab, self.advanced_tab):
+        self.monitor_tab = button("状态监测", lambda: self.select_page(1), "nav")
+        self.advanced_tab = button("高级设置", lambda: self.select_page(2), "nav")
+        for b in (self.console_tab, self.monitor_tab, self.advanced_tab):
             b.setCheckable(True)
         self.console_tab.setIcon(icon("console"))
+        self.monitor_tab.setIcon(icon("monitor"))
         self.advanced_tab.setIcon(icon("settings"))
         self.connection = label(role="connection")
         self.controller_state = label()
         self.global_stop = button("停止   Esc", s.stop_actuator_test, "stop")
         self.global_stop.setToolTip("STOP：停止运动并关闭驱动（Esc）")
         self.global_stop.setIcon(icon("stop", "#ffffff"))
-        hl.addLayout(
-            row(
+        self.navigation = QWidget()
+        nav_row = row(
                 glyph("brand", 30),
                 label("Xeryon Control", "brand"),
                 divider(True),
                 self.console_tab,
+                self.monitor_tab,
                 self.advanced_tab,
-                None,
+        )
+        nav_row.setContentsMargins(0, 0, 0, 0)
+        self.navigation.setLayout(nav_row)
+        self.header_status = QWidget()
+        status_row = row(
                 self.connection,
                 divider(True),
                 self.controller_state,
                 divider(True),
                 value_label(s.active_axis_var, "muted"),
                 self.global_stop,
-            )
         )
+        status_row.setContentsMargins(0, 0, 0, 0)
+        self.header_status.setLayout(status_row)
+        # Allow the window to shrink across the one-row/two-row breakpoint.
+        # Keep the contents at their natural width via the grid's alignment.
+        self.header_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.header_grid = QGridLayout()
+        self.header_grid.setContentsMargins(0, 0, 0, 0)
+        self.header_grid.setSpacing(3)
+        self.header_grid.addWidget(self.navigation, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        self.header_grid.addWidget(self.header_status, 1, 0, Qt.AlignmentFlag.AlignRight)
+        self.header_compact = True
+        hl.addLayout(self.header_grid)
         layout.addWidget(header)
         self.panel = PositionPanel(s)
         self.stack.addWidget(scroll(self.panel))
+        self.monitor = MonitorPage(s)
+        self.stack.addWidget(scroll(self.monitor))
         self.advanced = AdvancedPages(s, lambda: self.select_page(0), self.guarded)
         self.stack.addWidget(self.advanced)
         layout.addWidget(self.stack, 1)
@@ -160,12 +180,17 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        compact = event.size().width() < self.navigation.sizeHint().width() + self.header_status.sizeHint().width() + 45
+        if compact != self.header_compact:
+            self.header_compact = compact
+            self.header_grid.addWidget(self.header_status, int(compact), int(not compact), Qt.AlignmentFlag.AlignRight)
         self.panel.reflow(7 if event.size().width() >= 1100 else 4)
 
     def select_page(self, i):
         self.stack.setCurrentIndex(i)
         self.console_tab.setChecked(i == 0)
-        self.advanced_tab.setChecked(i == 1)
+        self.monitor_tab.setChecked(i == 1)
+        self.advanced_tab.setChecked(i == 2)
 
     def guarded(self, action):
         try:
@@ -177,8 +202,6 @@ class MainWindow(QMainWindow):
         self.panel.refresh()
         self.advanced.refresh()
         s = self.session
-        if self.setup_dialog is not None:
-            self.setup_dialog.setEnabled(not s.position_panel.editing_locked())
         online = s.connected_var.get() == "Connected"
         if self.connection.property("online") != online:
             self.connection.setProperty("online", online)
@@ -274,34 +297,6 @@ class MainWindow(QMainWindow):
         self.error_text.setText(text)
         self.present(self.error_dialog)
 
-    def show_motion_setup(self):
-        m = self.session.position_panel
-        if m.editing_locked():
-            return
-        if self.setup_dialog is None:
-            win, box, _ = self.notice(
-                "行程检查",
-                "核对中位和两端预留。仅本次连接有效。",
-            )
-            self.setup_dialog = win
-            box.addWidget(TravelReadout(m.travel_readings))
-            box.addLayout(row(label("机械中位 (µm)"), edit(m.center_coordinate)))
-            box.addWidget(
-                button("使用当前位置作为中位", m.use_current_position_as_center)
-            )
-            box.addLayout(row(label("每端预留 (µm)"), edit(m.end_margin)))
-            box.addWidget(
-                check(
-                    "确认实物位于机械中位", m.center_checked, m._mapping_check_changed
-                )
-            )
-
-            def apply():
-                if m.apply_travel():
-                    win.hide()
-
-            box.addLayout(row(button("确认行程映射", apply), button("取消", win.hide)))
-        self.present(self.setup_dialog)
 
     def show_confirmation(self, message, absolute, problem, review):
         self.close_confirmation()
@@ -338,8 +333,6 @@ class MainWindow(QMainWindow):
     def close_dialogs(self):
         if self.error_dialog:
             self.error_dialog.hide()
-        if self.setup_dialog:
-            self.setup_dialog.hide()
         if getattr(self, "repeat_dialog", None):
             self.repeat_dialog.reject()
 
@@ -395,6 +388,9 @@ def main():
         assert any(size.width() == 256 for size in window.windowIcon().availableSizes())
         assert window.session.network is None
         assert window.panel.actual.text() == "—"
+        window.monitor_tab.click()
+        assert window.stack.currentIndex() == 1 and len(window.monitor.charts) == 3
+        window.console_tab.click()
         assert window.advanced.count() == 6 and len(window.panel.presets) == 7
         window.close()
         return

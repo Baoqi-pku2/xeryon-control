@@ -148,13 +148,7 @@ class PositionPlot(QWidget):
             p.setPen(QColor("#91a6c2"))
             line(left - (6 if tick % 5 == 0 else 3), y, left, y)
         line(left, self.top, left, bottom)
-        if m.app.travel_range.confirmed:
-            lo, hi = m.app.travel_range.command_bounds
-            p.fillRect(
-                QRectF(left + 2, clip(lo), 2, clip(hi) - clip(lo)), QColor("#508996")
-            )
-
-        body = clip(zero) if m.user_zero_set else self.top
+        body = self.top
         actual = m.position
         if actual is not None and isfinite(actual):
             y = clip(actual)

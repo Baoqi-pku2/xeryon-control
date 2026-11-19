@@ -285,7 +285,6 @@ class StopTests(unittest.TestCase):
 
     def test_homing_cancellation_cannot_reenable_drive(self):
         a = app()
-        a.travel_range = Mock()
         a._invalidate_linked_zero = Mock()
         a._require_node = Mock(return_value=a.node)
         a._disable_drive_worker = Mock()
@@ -309,7 +308,6 @@ class StopTests(unittest.TestCase):
     def test_encoder_initialization_jump_cancels_target(self):
         a = app()
         a.inc_per_mm = 1000
-        a.travel_range = Mock()
         a.active_target_inc = None
         a.last_position_inc = 0
         a._require_node = Mock(return_value=a.node)
@@ -323,13 +321,11 @@ class StopTests(unittest.TestCase):
             a._move_absolute_worker(-100,{}, {})
         a._command_profile_position.assert_not_called()
         a._disable_drive_worker.assert_called_once()
-        a.travel_range.invalidate.assert_not_called()
         self.assertTrue(a.test_stop_requested.is_set())
 
     def test_stale_ui_coordinate_while_enabled_cancels_before_enable(self):
         a = app()
         a.inc_per_mm = 1000
-        a.travel_range = Mock()
         a.active_target_inc = None
         a.last_position_inc = 0
         a._require_node = Mock(return_value=a.node)
@@ -346,7 +342,6 @@ class StopTests(unittest.TestCase):
     def test_disabled_manual_adjustment_uses_live_start_without_moving_zero(self):
         a = app()
         a.inc_per_mm = 1000
-        a.travel_range = Mock()
         a.active_target_inc = None
         a.last_position_inc = 15000
         a._require_node = Mock(return_value=a.node)
@@ -361,13 +356,11 @@ class StopTests(unittest.TestCase):
         a._read_statusword.assert_called_once_with(a.node, fresh=True)
         a._prepare_profile_position.assert_called_once_with(a.node, {"velocity": 5, "acceleration": 50}, 15200)
         a._command_profile_position.assert_called_once_with(a.node, 16000)
-        a.travel_range.invalidate.assert_not_called()
         self.assertFalse(a.test_stop_requested.is_set())
 
     def test_small_enable_settling_keeps_absolute_target(self):
         a = app()
         a.inc_per_mm = 1000
-        a.travel_range = Mock()
         a.active_target_inc = None
         a.last_position_inc = 80
         a._require_node = Mock(return_value=a.node)
@@ -381,7 +374,6 @@ class StopTests(unittest.TestCase):
         a._command_profile_position.assert_called_once_with(a.node, 1000)
         self.assertEqual(a.active_start_inc, 70)
         self.assertFalse(a.test_stop_requested.is_set())
-        a.travel_range.invalidate.assert_not_called()
 
     def test_manual_motion_blocks_unrelated_commands_but_allows_disconnect(self):
         a = app()
@@ -398,7 +390,6 @@ class StopTests(unittest.TestCase):
     def test_failed_advanced_move_uses_verified_disable(self):
         a = app()
         a.inc_per_mm = 1000
-        a.travel_range = Mock()
         a.active_target_inc = None
         a.last_position_inc = 100
         a._require_node = Mock(return_value=a.node)

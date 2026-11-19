@@ -64,7 +64,7 @@ def check(output, preview=None):
             QTest.keyClicks(panel.port.lineEdit(), "COM47")
             assert session.channel_var.get() == "COM47"
             session.channel_var.set(current_port)
-            window.select_page(1)
+            window.advanced_tab.click()
             window.advanced.setCurrentIndex(1)
             encoder = window.advanced.encoder
             original_encoder = session.encoder_var.get()

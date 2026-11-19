@@ -25,13 +25,14 @@ from xeryon_control.application.feedback import (
 )
 from xeryon_control.application.linked_motion import LinkedMotion
 from xeryon_control.application.motion import PanelMotion, StartConfirmation, StartupDisplacement
+from xeryon_control.application.monitoring import MonitorSegment, MotionCapture
 from xeryon_control.application.calibration import sample_stationary_encoder
 from xeryon_control.hardware.drive import command_profile_positions, check_halted_profile_mode, operation_disabled
 from xeryon_control.application.repeatability import run_repeatability
-from xeryon_control.application.position import PositionModel
+from xeryon_control.application.position import CONSOLE_TARGET_HINT, PositionModel, valid_console_coordinate
 from xeryon_control.application.fields import Field
+from xeryon_control.application.zero_recovery import ZeroRecovery
 from xeryon_control.domain.shortcut_presets import SHORTCUT_PRESETS
-from xeryon_control.domain.travel import DEFAULT_WORK_MAX_UM, DEFAULT_WORK_MIN_UM, TravelRange
 from xeryon_control.domain.coordinates import AxisOrigins, from_counts, to_counts, to_encoder, to_user
 from xeryon_control.domain.workflow import next_workflow_stage
 from xeryon_control.hardware.stop import verify_disabled
@@ -77,9 +78,9 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
     def __init__(self) -> None:
 
         self.view = None
+        self.motion_capture = MotionCapture(self._post)
         self.available_axes = ["Actuator A"]
         self.origins = AxisOrigins()
-        self.travel_range = TravelRange()
         self.inc_per_mm = float(INC_PER_MM)
         self.test_results = []
         self.motion_trace_path = None
@@ -105,7 +106,6 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         self.reconnect_reason = ""
         self.reference_positions = {}
         self.node_identities = {}
-        self.travel_ranges: dict[str, TravelRange] = {}
         self.shortcut_active: Optional[dict[str, object]] = None
         self.shortcut_pending: list[dict[str, object]] = []
         self.shortcut_selected: list[int] = []
@@ -117,7 +117,6 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         self.active_axis = "Actuator A"
         self.linked_mode_enabled = False
         self.invert_b_enabled = False
-        self.default_limit_enabled = True
         self.pair_tolerance_um = 20.0
         self.last_statusword: Optional[int] = None
         self.disconnect_in_progress = False
@@ -131,11 +130,14 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         self.active_axis_var.subscribe(lambda *args: setattr(self, "active_axis", self.active_axis_var.get()))
         self.linked_mode_var.subscribe(lambda *args: setattr(self, "linked_mode_enabled", bool(self.linked_mode_var.get())))
         self.invert_b_var.subscribe(lambda *args: setattr(self, "invert_b_enabled", bool(self.invert_b_var.get())))
-        self.default_limit_var.subscribe(lambda *args: setattr(self, "default_limit_enabled", bool(self.default_limit_var.get())))
         self.pair_tolerance_var.subscribe(lambda *args: self._sync_pair_tolerance())
         self.position_panel = PositionModel(self)
+        self.zero_recovery = ZeroRecovery(self)
 
     def _build_variables(self) -> None:
+        self.monitor_axis_var = Field(value="开始后时间")
+        self.monitor_limit_var = Field(value=True)
+        self.monitor_count_var = Field(value="10")
         self.serial_ports, default_channel = self._serial_port_choices()
 
         self.interface_var = Field(value=str(CAN_INTERFACE))
@@ -175,7 +177,6 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         self.home_timeout_var = Field(value="30")
 
         self.limit_enabled_var = Field(value=False)
-        self.default_limit_var = Field(value=True)
         self.min_limit_var = Field(value="-29000.0")
         self.max_limit_var = Field(value="29000.0")
 
@@ -352,7 +353,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                 raise ValueError("请等待有效的位置反馈。")
             linked = self._linked_snapshot(require_zero=True)
             if not linked["enabled"] and not panel.user_zero_set:
-                raise ValueError("请先确认本轴收回端点零点。")
+                raise ValueError("请先设置本轴用户零点。")
             target_um = self._parse_float(panel.user_target, "目标位置")
             if not linked["enabled"]:
                 target_um = to_encoder(target_um, panel.user_zero_um)
@@ -382,6 +383,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             if (self.start_confirmation is not None or self.command_busy or self.active_target_inc is not None
                     or self.shortcut_active is not None or self.shortcut_pending):
                 raise ValueError("运动或快捷流程正在进行，请等待完成或先停止。")
+            self.monitor_clicked = time.monotonic()
             if self.shortcut_selected:
                 self.start_selected_shortcuts()
                 return
@@ -391,7 +393,9 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             if not panel.is_fresh():
                 raise ValueError("尚无有效的实时位置，请连接设备并等待编码器反馈。")
             target = self._parse_float(panel.target, "目标位置")
-            self.travel_range.validate(target, self._um_to_inc(target), self._inc_to_um(1), self.active_axis_var.get())
+            lo, hi = panel.display_bounds()
+            if not lo <= target <= hi or not valid_console_coordinate(panel.user_target.get()):
+                raise ValueError(CONSOLE_TARGET_HINT)
             speed = self._parse_positive_float(panel.speed, "速度")
             if not 2 <= speed <= 500:
                 raise ValueError("控制台速度须在 2–500 µm/s 范围内，且不能超过高级设置中的最大速度。")
@@ -419,22 +423,17 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             raise ValueError("快捷指令仅用于单轴控制，请先关闭双轴联动。")
         if not panel.is_fresh():
             raise ValueError("尚无有效的实时位置，请连接设备并等待编码器反馈。")
-        if not panel.user_zero_set or not self.travel_range.confirmed:
-            raise ValueError("请先将推杆置于收回端点，并点击“实物当前位置 = 0”。")
+        if not panel.user_zero_set:
+            raise ValueError("请先设置本轴用户零点。")
         if not 2 <= speed <= 500:
             raise ValueError("序列速度须在 2–500 µm/s 范围内。")
 
         axis = self._active_axis_name()
         if number == 5:
             user_target = self._parse_float(self.workflow_start_var, "工作起点")
+        if not valid_console_coordinate(user_target):
+            raise ValueError(CONSOLE_TARGET_HINT)
         target = to_encoder(user_target, panel.user_zero_um)
-        try:
-            self.travel_range.validate(target, self._um_to_inc(target), self._inc_to_um(1), axis)
-        except ValueError as exc:
-            raise ValueError(
-                f"快捷 {number} {name}：用户目标 {user_target:g} µm，"
-                f"收回端零点为编码器 {panel.user_zero_um:.2f} µm。{exc}"
-            ) from exc
         limits = self._limits_snapshot()
         self._validate_target(target, limits)
         dwell = self._parse_nonnegative_float(self.shortcut_dwell_var, "步骤间停留秒数")
@@ -515,6 +514,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             self.shortcut_active = step
             self.shortcut_pending.clear()
             created_sequence = True
+            self.monitor_clicked = time.monotonic()
             self._start_shortcut_step(step)
         except Exception as exc:
             if created_sequence:
@@ -540,8 +540,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         motion = PanelMotion(label, target, dict(profile), dict(limits), node,
                              self._active_axis_name() if step is None else step["axis"],
                              panel.user_zero_um, panel.user_zero_set, self._um_to_inc(panel.position),
-                             self.travel_range.command_bounds,
-                             self.cancel_generation, step)
+                             self.cancel_generation, step, getattr(self, "monitor_clicked", time.monotonic()))
         return self._dispatch_panel_move(motion)
 
     def _dispatch_panel_move(self, motion, approved_start=None):
@@ -563,7 +562,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                 # The driver adds derived jerk values to its working profile.
                 # Keep the operator's original settings for the confirmation check.
                 self._move_absolute_worker(motion.target, dict(motion.profile), motion.limits,
-                                           expected_start_inc=expected)
+                                           expected_start_inc=expected, monitor_motion=motion)
             except StartupDisplacement as exc:
                 stopped = exc.stopped.get(motion.node.id) if isinstance(exc.stopped, dict) else None
                 if stopped and operation_disabled(stopped["statusword"]):
@@ -697,13 +696,18 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         if generation is not None:
             self._post("shortcut_failed", {"generation": generation, "reason": reason})
 
-    def set_current_user_zero(self) -> None:
+    def set_current_user_zero(self, *, coordinate_field: Field | None = None) -> None:
         try:
             panel = self.position_panel
             if panel.editing_locked() or not panel.is_fresh() or self.linked_mode_var.get():
                 raise ValueError("请先停止单轴运动，并等待有效位置反馈。")
             node, axis = self._require_node(), self.active_axis_var.get()
-            self._safe_start("刷新编码器并置零", lambda: self._capture_user_zero_worker(node, axis))
+            coordinate = 0.0
+            if coordinate_field is not None:
+                coordinate = self._parse_float(coordinate_field, "用户坐标")
+                if abs(coordinate) > self._inc_to_um(2**32 - 1):
+                    raise ValueError("用户坐标超出编码器可表示的跨度。")
+            self._safe_start("刷新编码器并置零", lambda: self._capture_user_zero_worker(node, axis, coordinate))
         except Exception as exc:
             self._show_error(str(exc))
 
@@ -745,12 +749,16 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             "state": str(node.state), "mode": self._read_mode(node),
         })
 
-    def _capture_user_zero_worker(self, node, axis):
+
+    def _capture_user_zero_worker(self, node, axis, coordinate=0.0):
         generation = self.cancel_generation
         self._reset_motion_cancel()
         position = self._sample_stationary_position(node)
-        self._post("user_zero", {"axis": axis, "node": node, "generation": generation,
-                                 "raw_um": self._inc_to_um(position), "sample_time": time.monotonic()})
+        self._post("user_zero", {
+            "axis": axis, "node": node, "generation": generation, "coordinate": coordinate,
+            "position_inc": position,
+            "raw_um": self._inc_to_um(position), "sample_time": time.monotonic(),
+        })
 
     def _sample_stationary_position(self, node):
         def enable_and_sample(baseline):
@@ -902,8 +910,8 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                 if max(positions) - min(positions) > linked["tolerance_um"]:
                     raise ValueError("双轴位置差超过容差")
             else:
-                if not panel.user_zero_set or not self.travel_range.confirmed:
-                    raise ValueError("请确认本轴收回端点零点和行程")
+                if not panel.user_zero_set:
+                    raise ValueError("请设置本轴用户零点")
                 positions = [to_user(panel.position, panel.user_zero_um)]
             start, switch, end = (self._parse_float(v, name) for v, name in (
                 (self.workflow_start_var, "工作起点"), (self.workflow_switch_var, "切换点"),
@@ -1007,6 +1015,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         self.reference_review = None
         self.reconnect_reason = ""
         self.network = network
+        self.connection_address = (interface, channel)
         self.stop_unconfirmed = False
         self.nodes = node_map
         self.node = self.nodes["Actuator A"]
@@ -1059,6 +1068,9 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         node.sdo[0x1802][3].raw = TPDO3_INHIBIT_TIME_100US
         node.sdo[0x1802][1].raw = tpdo3_cob_id
         node.setup_402_state_machine()
+        capture = self.__dict__.get("motion_capture")
+        if capture is not None:
+            node.tpdo[3].add_callback(lambda pdo: capture.on_pdo(node, pdo))
         node.tpdo_pointers.pop(0x6041, None)
         node.tpdo_values.pop(0x6041, None)
         node.rpdo_pointers.pop(0x6040, None)
@@ -1177,6 +1189,9 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
 
     def _disconnect_worker(self, *, verify_stop: bool = True) -> None:
         disable_error = None
+        recovery = self.__dict__.get("zero_recovery")
+        if recovery is not None:
+            recovery.capture_before_disconnect()
         try:
             if verify_stop and self.node is not None:
                 try:
@@ -1269,7 +1284,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         target_um: float,
         profile: dict[str, float | int],
         limits: dict[str, float | bool],
-        *, expected_start_inc: Optional[int] = None,
+        *, expected_start_inc: Optional[int] = None, monitor_motion: Optional[PanelMotion] = None,
     ) -> None:
         node = self._require_node()
         target_inc = self._um_to_inc(target_um)
@@ -1292,12 +1307,18 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                 self._disable_drive_worker()
                 return
             start_inc = self._read_actual_position_inc(node, fresh=True)
+            start_stamp = time.monotonic()
             self._check_position_reference(baseline, start_inc)
             if expected_start_inc is not None and expected_start_inc != baseline:
                 self._check_position_reference(expected_start_inc, start_inc)
 
             self._start_motion_trace(node, start_inc, target_inc, profile)
             self._invalidate_linked_zero("single-axis move")
+            if monitor_motion is not None:
+                motion = monitor_motion
+                segment = MonitorSegment(motion.clicked, motion.axis, motion.label,
+                                         self._inc_to_um(1), motion.zero, motion.zero_set)
+                self.motion_capture.begin(node, segment, start_inc, start_stamp)
             self._command_profile_position(node, target_inc)
             self._post("target_coordinate", self._inc_to_um(target_inc))
 
@@ -1362,8 +1383,8 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         linked = self._linked_snapshot(require_zero=True)
         paired = bool(linked["enabled"])
         panel = self.position_panel
-        if not paired and (not panel.user_zero_set or not self.travel_range.confirmed):
-            raise ValueError("分段流程需要已确认的收回端点零点，请先置零。")
+        if not paired and not panel.user_zero_set:
+            raise ValueError("请先完成用户置零。")
         offset = 0.0 if paired else panel.user_zero_um
         start, switch, end = (float(config[key]) for key in ("start", "switch", "end"))
         limits = dict(config["limits"])
@@ -1722,8 +1743,10 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
 
 
     def _home_worker(self, direction_positive: bool, offset_um: float, timeout_seconds: float) -> None:
+        recovery = self.__dict__.get("zero_recovery")
+        if recovery is not None:
+            recovery.suspend_axis(self._active_axis_name())
         self._post("clear_user_zero", None)
-        self.travel_range.invalidate()
         self._invalidate_linked_zero("homing")
         node = self._require_node()
 
@@ -2030,10 +2053,6 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         enabled = self.__dict__.get("linked_mode_enabled")
         return bool(enabled) if enabled is not None else bool(self.linked_mode_var.get())
 
-    def _default_limit_is_enabled(self) -> bool:
-        enabled = self.__dict__.get("default_limit_enabled")
-        return bool(enabled) if enabled is not None else bool(self.default_limit_var.get())
-
     def _sync_pair_tolerance(self) -> None:
         try:
             self.pair_tolerance_um = self._parse_positive_float(self.pair_tolerance_var, "maximum A/B mismatch")
@@ -2042,41 +2061,11 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             # cached value so a subsequent start cannot silently use an old one.
             self.pair_tolerance_um = float("nan")
 
-    def _validate_default_limit(self, target_um: float) -> None:
-        if not self._default_limit_is_enabled():
-            return
-        linked = self._linked_mode_enabled()
-        panel = self.__dict__.get("position_panel")
-        if linked:
-            if not self.linked_zero_offsets_inc:
-                raise ValueError("默认限位下使用双轴联动前，请先设置联动零点。")
-            low, high = DEFAULT_WORK_MIN_UM, DEFAULT_WORK_MAX_UM
-            user_target = target_um
-        else:
-            if panel is None or not panel.user_zero_set or not self.travel_range.confirmed:
-                raise ValueError("默认限位已开启。请先在收回端点置零。")
-            low = to_encoder(DEFAULT_WORK_MIN_UM, panel.user_zero_um)
-            high = to_encoder(DEFAULT_WORK_MAX_UM, panel.user_zero_um)
-            user_target = to_user(target_um, panel.user_zero_um)
-
-        um_per_count = self._inc_to_um(1)
-        target_inc = self._um_to_inc(target_um)
-        low_inc = ceil(low / um_per_count)
-        high_inc = floor(high / um_per_count)
-        if target_um < low or target_um > high or not low_inc <= target_inc <= high_inc:
-            raise ValueError(
-                f"目标 {user_target:.2f} µm 超出默认限位 "
-                f"{DEFAULT_WORK_MIN_UM:.0f}–{DEFAULT_WORK_MAX_UM:.0f} µm。"
-                "可在高级设置的行程/零点页取消默认限位。"
-            )
-
     def _validate_target(self, target_um: float, limits: dict[str, float | bool]) -> None:
-        self._validate_default_limit(target_um)
-        travel = self.__dict__.get("travel_range")
-        if not self._linked_mode_enabled():
-            if travel is None:
-                raise ValueError("缺少机械行程映射，请先确认行程或完成置零。")
-            travel.validate(target_um, self._um_to_inc(target_um), self._inc_to_um(1), self._active_axis_name())
+        if not isfinite(target_um):
+            raise ValueError("目标坐标必须是有限数值。")
+        if not -2**31 <= self._um_to_inc(target_um) <= 2**31 - 1:
+            raise ValueError("目标坐标超出驱动器可表示的范围。")
         if not bool(limits["enabled"]):
             return
 
@@ -2275,24 +2264,6 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         if enabled and min_limit >= max_limit:
             raise ValueError("Minimum limit must be lower than maximum limit.")
 
-        linked = self._linked_mode_enabled()
-        if enabled and self.travel_range.confirmed and not linked:
-            low, high = self.travel_range.command_bounds
-            if min_limit < low or max_limit > high:
-                raise ValueError(f"工作区间必须位于已确认行程 {low:.2f} 至 {high:.2f} µm 内。")
-
-        panel = self.__dict__.get("position_panel")
-        if enabled and self._default_limit_is_enabled():
-            if linked:
-                low, high = DEFAULT_WORK_MIN_UM, DEFAULT_WORK_MAX_UM
-            elif panel is not None and panel.default_limit_active():
-                low = to_encoder(DEFAULT_WORK_MIN_UM, panel.user_zero_um)
-                high = to_encoder(DEFAULT_WORK_MAX_UM, panel.user_zero_um)
-            else:
-                raise ValueError("默认限位下请先完成收回端点置零。")
-            if min_limit < low or max_limit > high:
-                raise ValueError("自定义工作区间不能超出默认限位 0–13000 µm。")
-
         return {"enabled": enabled, "min": min_limit, "max": max_limit}
 
     def _home_snapshot(self) -> tuple[bool, float, float]:
@@ -2391,7 +2362,13 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             self.schedule(10 if not self.ui_queue.empty() else 100, self._drain_ui_queue)
 
     def _handle_ui_event(self, kind: str, payload: object) -> None:
-        if kind == "log":
+        if kind == "save_zero_recovery":
+            if self.view and self.view.preferences is not None:
+                self.view.preferences.save_zero_recovery()
+        elif kind in ("monitor_sample", "monitor_end"):
+            if self.view:
+                self.view.monitor.receive(kind, payload)
+        elif kind == "log":
             self._log(str(payload))
         elif kind == "error":
             self._show_error(str(payload))
@@ -2445,8 +2422,8 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                     self.reference_positions[payload["axis"]] = self.last_position_inc
                     self._set_status(payload, initialize_target=False)
                     return
-                self.position_panel.apply_user_zero(payload["raw_um"], payload["sample_time"])
-                self._log(f"编码器已刷新，驱动已关闭并停稳。收回端零点 = {payload['raw_um']:.4f} µm。")
+                self.position_panel.apply_offset_zero(payload["raw_um"], payload["sample_time"], payload["coordinate"])
+                self._log(f"{payload['axis']} 编码器 {payload['raw_um']:.4f} µm 对应用户位置 {payload['coordinate']:+.2f} µm。")
         elif kind == "clear_user_zero":
             self.position_panel.forget_axis_zero()
         elif kind == "target_start":
@@ -2527,7 +2504,6 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
         self.connected_var.set("Connected" if connected else "Disconnected")
         if not connected:
             self.position_panel.invalidate()
-            self.__dict__.get("travel_ranges", {}).clear()
             self.position_var.set("-")
             self.target_status_var.set("-")
             self.target_start_var.set("-")
@@ -2629,9 +2605,8 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                 or self._linked_mode_enabled()):
             raise RuntimeError("原启动请求已失效。")
         if (panel.user_zero_um != motion.zero
-                or panel.user_zero_set != motion.zero_set or not self.travel_range.confirmed
-                or self.travel_range.command_bounds != motion.bounds):
-            raise ValueError("零点或行程设置已改变，请重新核对。")
+                or panel.user_zero_set != motion.zero_set):
+            raise ValueError("用户零点已改变，请重新核对。")
         target = self._parse_float(panel.target, "目标")
         speed = self._parse_positive_float(panel.speed, "速度")
         if not 2 <= speed <= 500:
@@ -2669,7 +2644,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                    f"预计位移 {target-current:+.2f} µm，速度 {motion.profile['velocity']:g} µm/s。\n"
                    "从新起点继续？")
         if motion.zero_set and review.previous_inc == self._um_to_inc(motion.zero):
-            message += "\n仍在收回端点？请取消，再点「收回端点置零」。"
+            message += "\n若此处应为用户零点，请取消后点击「当前位置置零」。"
         if original is not review:
             message = "设置已更新，请核对。\n" + message
         absolute = f"编码器绝对位置 {current:.2f} µm"

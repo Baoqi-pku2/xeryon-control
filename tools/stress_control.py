@@ -267,7 +267,6 @@ def run(plan, output, hardware, acceleration, reference_count=-143):
             app._set_status({'axis': 'Actuator A', 'position_um': app._inc_to_um(current),
                              'sample_time': now, 'statusword': app.last_statusword,
                              'state': app.state_var.get(), 'mode': app.mode_var.get()})
-            app.position_panel.apply_travel()
             report['initial_position_inc'] = current
             if 'initial_fixture_user_um' in plan:
                 actual_user = app._inc_to_um(current-reference_count)

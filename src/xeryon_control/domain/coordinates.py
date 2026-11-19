@@ -25,10 +25,14 @@ class AxisOrigins:
         self.active_um: float | None = None
 
     def capture(self, axis: str, encoder_um: float) -> None:
-        self._zeros[axis] = self.active_um = encoder_um
+        self._zeros[axis] = encoder_um
+        self.active_um = encoder_um
 
-    def select(self, axis: str, travel_confirmed: bool) -> None:
-        self.active_um = self._zeros.get(axis) if travel_confirmed else None
+    def select(self, axis: str) -> None:
+        self.active_um = self._zeros.get(axis)
+
+    def get(self, axis: str) -> float | None:
+        return self._zeros.get(axis)
 
     def forget(self, axis: str) -> None:
         self._zeros.pop(axis, None)

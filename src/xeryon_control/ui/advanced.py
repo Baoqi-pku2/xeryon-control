@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
 )
 from xeryon_control.ui.icons import icon
 from xeryon_control.hardware.parameters import CANBitrate
-from xeryon_control.ui.travel_readout import TravelReadout
 from xeryon_control.ui.widgets import (
     button,
     check,
@@ -110,6 +109,7 @@ class AdvancedPages(QTabWidget):
                 span = 2 if wide else 1
                 title = label(name, "muted")
                 control = value_label(field, "settingValue", True) if readonly else edit(field)
+                control.setAccessibleName(name)
                 title.setBuddy(control)
                 grid.addWidget(title, 3 * row_index, column, 1, span)
                 grid.addWidget(control, 3 * row_index + 1, column, 1, span)
@@ -367,33 +367,29 @@ class AdvancedPages(QTabWidget):
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().hide()
         tests.outer.insertWidget(1, self.table, 1)
-        limits = page("行程 / 零点", "position")
-        form = group(limits, "行程标定", "position", 0)
-        for name, field in [
-            ("机械中位编码器坐标 (µm)", m.center_coordinate),
-            ("每端预留 (µm)", m.end_margin),
-            ("局部视图跨度 (µm)", m.span),
-        ]:
-            w = edit(field)
-            form.addRow(name, w)
-            self.locked_widgets.append(w)
-        for w in [
-            check("确认实物位于机械中位", m.center_checked, m._mapping_check_changed),
-            check(
-                "开启默认工作限位 0–13 mm", s.default_limit_var, m.default_limit_changed
-            ),
-            button("使用当前位置作为中位", m.use_current_position_as_center),
-            button("确认行程映射（不运动）", m.apply_travel),
-        ]:
-            form.addRow(w)
-            self.locked_widgets.append(w)
-        group(limits, "行程概览", "pulse", 1).addRow(TravelReadout(m.travel_readings))
-        form.addRow(
-            label("请核对实物中位及安装余量。", "muted")
-        )
+        limits = page("零点 / 限位", "position")
+        form = group(limits, "位置视图", "position", 0)
+        form.addRow("局部视图跨度 (µm)", edit(m.span))
+        form.addRow(label("控制台显示范围 0–13 mm", "muted"))
         actions(form, [("返回实时位置", show_console)])
+        form = group(limits, "用户零点偏移", "position", 0)
+        form.addRow("将当前位置记为 (µm)", edit(m.offset_coordinate))
+        form.addRow("当前目标 (µm)", value_label(m.user_target))
+        self.offset_buttons = [
+            button("应用手动偏移", lambda: s.set_current_user_zero(coordinate_field=m.offset_coordinate)),
+            button("根据目标位置设置偏移", lambda: s.set_current_user_zero(coordinate_field=m.user_target)),
+        ]
+        form.addRow(row(*self.offset_buttons, None))
+        form.addRow(label("请先松手。采样时驱动会短暂开启，停稳后更新坐标。", "muted"))
+        form = group(limits, "零点恢复", "position", 0)
+        self.zero_recovery_status = label(s.zero_recovery.description(), "muted")
+        self.zero_recovery_status.setWordWrap(True)
+        form.addRow(self.zero_recovery_status)
+        self.restore_zero = button("恢复上一次零点位置", lambda: guarded(s.zero_recovery.request_restore))
+        form.addRow(self.restore_zero)
+        form.addRow(label("仅在当前位置与记录一致时恢复。不会返回零点。", "muted"))
         form = group(limits, "工作区间（编码器坐标）", "settings", 1)
-        form.addRow(check("开启更窄的工作区间", s.limit_enabled_var))
+        form.addRow(check("开启自定义工作区间", s.limit_enabled_var))
         fields(
             form,
             [("最小坐标 (µm)", s.min_limit_var), ("最大坐标 (µm)", s.max_limit_var)],
@@ -414,6 +410,13 @@ class AdvancedPages(QTabWidget):
 
     def refresh(self):
         s = self.session
+        self.zero_recovery_status.setText(s.zero_recovery.description())
+        self.restore_zero.setEnabled(
+            s.node is not None and s.position_panel.is_fresh()
+            and not s.position_panel.user_zero_set and s.zero_recovery.record() is not None
+            and not s.position_panel.editing_locked() and not s.linked_mode_var.get()
+            and s.reference_review is None and not s.reconnect_reason
+            and not (s.close_in_progress or s.disconnect_in_progress))
         locked = (
             s.command_busy
             or s.start_confirmation is not None
@@ -435,6 +438,11 @@ class AdvancedPages(QTabWidget):
             )
         for w in self.locked_widgets:
             w.setEnabled(not s.position_panel.editing_locked())
+        for w in self.offset_buttons:
+            w.setEnabled(s.node is not None and s.position_panel.is_fresh()
+                         and not s.position_panel.editing_locked() and not s.linked_mode_var.get()
+                         and s.reference_review is None and not s.reconnect_reason
+                         and not (s.close_in_progress or s.disconnect_in_progress))
         for w, choices, field in (
             (self.axis, s.available_axes, s.active_axis_var),
             (self.port, s.serial_ports, s.channel_var),

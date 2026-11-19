@@ -495,16 +495,9 @@ class LinkedMotion:
 
     def _validate_linked_targets(self, targets_inc: dict[str, int], linked: dict[str, object]) -> None:
         for axis, _, _ in self._require_linked_axes(linked):
-            travel = self.travel_ranges.get(axis)
-            if travel is None or not travel.confirmed:
-                raise ValueError(f"双轴 {axis} 缺少有效的机械行程映射，已拒绝联动目标。")
             target_inc = int(targets_inc[axis])
-            travel.validate(
-                self._inc_to_um(target_inc),
-                target_inc,
-                self._inc_to_um(1),
-                axis,
-            )
+            if not -2**31 <= target_inc <= 2**31 - 1:
+                raise ValueError(f"{axis} 目标坐标超出驱动器可表示的范围。")
 
     def _linked_targets_for_logical_position(
         self,

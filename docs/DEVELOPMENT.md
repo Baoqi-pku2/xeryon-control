@@ -24,7 +24,7 @@
 
 | 包内路径 | 职责 |
 | --- | --- |
-| `domain/` | 坐标换算、各轴零点、机械行程和分段规划，可直接脱离 GUI 和设备测试 |
+| `domain/` | 坐标换算、各轴零点、设备标称尺寸和分段规划，可直接脱离 GUI 和设备测试 |
 | `application/session.py`、`position.py` | 界面独立的设备会话、坐标输入和位置反馈显示状态 |
 | `application/commands.py` | 普通命令准入、后台执行、取消代次，以及带取消检查的设备写入 |
 | `application/feedback.py` | 轮询节流、SDO/PDO 反馈、目标进度、到位与异常复核 |

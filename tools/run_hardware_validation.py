@@ -159,7 +159,6 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
                             "sample_time": time.monotonic(), "statusword": app.last_statusword,
                             "state": app.state_var.get(), "mode": app.mode_var.get()})
             report["initial_position_inc"] = current
-            app.position_panel.apply_travel()
             if sequence:
                 for number in range(1, 8):
                     window.panel.presets[number].click()
@@ -167,8 +166,8 @@ def run(phase, output, speed, acceleration, targets_user=None, tick_ms=100, refe
                 window.panel.start.click()
                 state = "sequence_moving"
             else:
-                # Both targets must pass the application's real travel/default
-                # limits. No callbacks or safety methods are mocked.
+                # Both targets must pass the application's custom limits and
+                # device count bounds. No callbacks or safety methods are mocked.
                 targets = ([app._um_to_inc(app._inc_to_um(reference_count) + float(value)) for value in targets_user]
                            if targets_user is not None else [app._um_to_inc(app._inc_to_um(reference_count) + 50)]
                            if phase == "target50" else [current + 100, current])

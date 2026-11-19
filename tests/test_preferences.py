@@ -45,7 +45,6 @@ class PreferencesTests(unittest.TestCase):
         self.assertEqual(second.panel.dwell.text(), "17")
         self.assertTrue(second.session.invert_b_enabled)
         self.assertFalse(second.session.position_panel.user_zero_set)
-        self.assertFalse(second.session.travel_range.confirmed)
         self.assertFalse(second.session.shortcut_selected)
         self.assertIsNone(second.session.network)
         self.assertEqual(float(second.session.target_position_var.get()), 0)
@@ -63,3 +62,36 @@ class PreferencesTests(unittest.TestCase):
         a.finish_exit()
         b.finish_exit()
         self.assertEqual(self.window().session.node_id_var.get(), "47")
+
+    def test_old_default_limit_setting_cannot_restore_fixed_interval(self):
+        store = QSettings(str(self.path), QSettings.Format.IniFormat)
+        store.setValue("limits/default_limit", True)
+        store.sync()
+        window = self.window()
+        panel = window.session.position_panel
+        panel.apply_user_zero(100, 0)
+        self.assertEqual(panel.display_bounds(), (100, 13100))
+        window.session._validate_target(20100, {"enabled": False})
+
+    def test_obsolete_endpoints_are_removed_without_losing_custom_limits(self):
+        store = QSettings(str(self.path), QSettings.Format.IniFormat)
+        store.setValue("calibration/endpoints", '{"old": {"endpoint_um": 12345}}')
+        store.setValue("panel/end_margin", "1000")
+        store.setValue("limits/limit_enabled", True)
+        store.setValue("limits/min_limit", "-1000")
+        store.setValue("limits/max_limit", "2000")
+        store.sync()
+        window = self.window()
+        s = window.session
+        expected = {"enabled": True, "min": -1000, "max": 2000}
+        self.assertEqual(s._limits_snapshot(), expected)
+        s.position_panel.apply_user_zero(500, 0)
+        self.assertEqual(s._limits_snapshot(), expected)
+        with self.assertRaises(ValueError):
+            s._validate_target(-1500, expected)
+        s._validate_target(-500, expected)
+        window.finish_exit()
+        store.sync()
+        self.assertFalse(store.contains("calibration/endpoints"))
+        self.assertFalse(store.contains("panel/end_margin"))
+        self.assertEqual(self.window().session._limits_snapshot(), expected)

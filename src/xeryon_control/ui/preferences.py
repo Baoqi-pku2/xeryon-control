@@ -15,6 +15,7 @@ def preferences_path():
 
 # Keys are also the session's field names, without the _var suffix.
 GROUPS = {
+    "monitor": ("monitor_axis", "monitor_limit", "monitor_count"),
     "connection": ("interface", "channel", "bitrate", "node_id", "node_b_enabled",
                    "node_b_id", "encoder", "eds_path", "reset_on_connect", "boot_timeout", "probe_limit"),
     "motion": ("velocity", "acceleration", "max_velocity", "max_acceleration", "quick_stop_decel",
@@ -24,7 +25,7 @@ GROUPS = {
                  "workflow_slow_speed", "workflow_fast_acceleration", "workflow_travel_limit",
                  "workflow_timeout", "shortcut_dwell"),
     "axes": ("linked_mode", "invert_b", "pair_tolerance"),
-    "limits": ("default_limit", "limit_enabled", "min_limit", "max_limit"),
+    "limits": ("limit_enabled", "min_limit", "max_limit"),
     "test": ("test_speeds", "test_distances", "test_return", "test_settle", "test_timeout",
              "repeat_cycles", "repeat_span", "repeat_speed"),
 }
@@ -40,6 +41,10 @@ def decode(name, value, default):
         return value
     if name == "encoder":
         return value if value in ("10MU", "1MU", "250NAN", "100NAN") else None
+    if name == "monitor_axis":
+        return value if value in ("开始后时间", "实际位置") else None
+    if name == "monitor_count":
+        return value if value.isascii() and value.isdigit() and 1 <= int(value) <= 999 else None
     if name == "home_direction":
         return value if value in ("Positive index", "Negative index") else None
     parts = value.replace(";", ",").split(",") if name in ("test_speeds", "test_distances") else [value]
@@ -59,11 +64,23 @@ class Preferences:
         self.timer.setInterval(500)
         self.timer.timeout.connect(self.flush)
         store = self._open()
+        # Discard obsolete endpoint mappings; keep operator preferences.
+        store.remove("calibration/endpoints")
+        store.remove("panel/end_margin")
+        store.remove("panel/center_coordinate")
+        self.zero_recovery = session.zero_recovery
+        self.saved_zero_recovery = None
+        if store.contains("recovery/user_zeros"):
+            try:
+                self.zero_recovery.load(store.value("recovery/user_zeros"))
+                self.saved_zero_recovery = self.zero_recovery.serialize()
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                self.report_error(f"零点记录读取失败：{exc}")
         fields = [(f"{group}/{name}", name, getattr(session, name + "_var"))
                   for group, names in GROUPS.items() for name in names]
         panel = session.position_panel
         fields.extend((f"panel/{name}", name, getattr(panel, name))
-                      for name in ("speed", "span", "center_coordinate", "end_margin"))
+                      for name in ("speed", "span"))
         for key, name, field in fields:
             default = field.get()
             if store.contains(key):
@@ -77,6 +94,18 @@ class Preferences:
     def _open(self):
         return QSettings(self.path, QSettings.Format.IniFormat)
 
+    def save_zero_recovery(self):
+        serialized = self.zero_recovery.serialize()
+        if serialized == self.saved_zero_recovery:
+            return
+        store = self._open()
+        store.setValue("recovery/user_zeros", serialized)
+        store.sync()
+        if store.status() == QSettings.Status.NoError:
+            self.saved_zero_recovery = serialized
+        else:
+            self.report_error(f"零点记录保存失败：{self.path}")
+
     def _changed(self, key, name, default, value):
         if decode(name, value, default) is None:
             self.pending.pop(key, None)
@@ -87,6 +116,7 @@ class Preferences:
 
     def flush(self):
         self.timer.stop()
+        self.save_zero_recovery()
         if not self.pending:
             return
         store = self._open()

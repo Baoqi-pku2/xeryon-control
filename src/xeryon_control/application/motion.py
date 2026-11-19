@@ -19,9 +19,9 @@ class PanelMotion:
     zero: float
     zero_set: bool
     displayed_inc: int
-    bounds: tuple
     generation: int
     step: Optional[dict]
+    clicked: float = 0.0
 
 
 class StartupDisplacement(RuntimeError):

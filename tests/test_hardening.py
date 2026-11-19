@@ -11,7 +11,6 @@ from xeryon_control.application.session import ControllerSession as Gui
 from xeryon_control.hardware import canopen_io as utils
 from xeryon_control.hardware.parameters import NodeOperationMode
 from xeryon_control.application.repeatability import run_repeatability
-from xeryon_control.domain.travel import TravelRange
 
 
 def var(value):
@@ -24,9 +23,6 @@ def make_app():
     app.active_axis = "Actuator A"
     app.linked_mode_enabled = False
     app.invert_b_enabled = False
-    app.default_limit_enabled = True
-    app.travel_range = TravelRange()
-    app.travel_ranges = {}
     app.node_identities = {}
     app.position_panel = NS(user_zero_um=0.0, user_zero_set=False)
     app.linked_zero_offsets_inc = {}
@@ -59,11 +55,6 @@ def linked_app():
     app.linked_mode_enabled = True
     app.pair_tolerance_um = 20.0
     app.linked_zero_offsets_inc = {"Actuator A": 0, "Actuator B": 0}
-    app.travel_ranges = {}
-    for axis in ("Actuator A", "Actuator B"):
-        travel = TravelRange()
-        travel.confirm(0, 50, axis)
-        app.travel_ranges[axis] = travel
     app.nodes = {
         "Actuator A": NS(id=32, tpdo={3: NS(wait_for_reception=Mock())}),
         "Actuator B": NS(id=33, tpdo={3: NS(wait_for_reception=Mock())}),
@@ -95,10 +86,6 @@ class HardeningTests(unittest.TestCase):
             app.refresh_ports()
             app.channel_var.set.assert_called_once_with("COM4")
 
-    def test_default_limit_requires_coordinate_reference(self):
-        app = make_app()
-        with self.assertRaisesRegex(ValueError, "置零"):
-            app._validate_target(100000, {"enabled": False})
 
     def test_linked_relative_always_validates_each_axis(self):
         app = linked_app()
@@ -109,11 +96,38 @@ class HardeningTests(unittest.TestCase):
         app._move_linked_relative_worker(100, {"velocity": 5, "acceleration": 50}, {"enabled": False}, link)
         self.assertEqual(app._validate_target.call_count, 2)
 
-    def test_linked_default_limit_uses_logical_coordinates(self):
+    def test_linked_targets_have_no_fixed_default_interval(self):
         app = linked_app()
         app._validate_target(1000, {"enabled": False})
-        with self.assertRaisesRegex(ValueError, "默认限位"):
-            app._validate_target(-20000, {"enabled": False})
+        app._validate_target(-20000, {"enabled": False})
+        app._validate_target(20000, {"enabled": False})
+
+    def test_negative_user_targets_obey_custom_limits(self):
+        for zero in (-5000, 5000):
+            with self.subTest(zero=zero):
+                app = make_app()
+                app.position_panel.user_zero_set = True
+                app.position_panel.user_zero_um = zero
+                app._validate_target(zero - 1000, {"enabled": False})
+                app._validate_target(zero - 30000, {"enabled": False})
+                with self.assertRaisesRegex(ValueError, "enabled limits"):
+                    app._validate_target(zero - 1000,
+                                         {"enabled": True, "min": zero - 500, "max": zero + 500})
+                app._validate_target(zero + 20000, {"enabled": False})
+
+    def test_custom_limits_can_span_both_sides_of_old_default_interval(self):
+        for linked in (False, True):
+            with self.subTest(linked=linked):
+                app = linked_app() if linked else make_app()
+                app.position_panel.user_zero_set = True
+                app.limit_enabled_var = var(True)
+                app.min_limit_var = var("-1000")
+                app.max_limit_var = var("1000")
+                self.assertEqual(app._limits_snapshot(),
+                                 {"enabled": True, "min": -1000, "max": 1000})
+                app.max_limit_var = var("20000")
+                self.assertEqual(app._limits_snapshot(),
+                                 {"enabled": True, "min": -1000, "max": 20000})
 
     def test_linked_drive_fault_stops_immediately(self):
         app = linked_app()
@@ -136,13 +150,11 @@ class HardeningTests(unittest.TestCase):
 
     def test_unexpected_displacement_stops_both_axes_and_preserves_pair_reference(self):
         app = linked_app()
-        app.travel_range = Mock()
         app._disable_drive_worker = Mock()
         with self.assertRaises(RuntimeError):
             app._check_position_reference(1000, 20000)
         self.assertEqual(app.linked_zero_offsets_inc, {"Actuator A": 0, "Actuator B": 0})
         app._disable_drive_worker.assert_called_once()
-        app.travel_range.invalidate.assert_not_called()
 
     def test_reconnect_verifies_disable_before_clearing_unknown_stop(self):
         app = make_app()
@@ -209,17 +221,27 @@ class HardeningTests(unittest.TestCase):
         app = linked_app()
         app.pair_tolerance_var = var("20")
         app._read_actual_position_inc = Mock(return_value=0)
-        app._run_linked_move = Mock()
         config = dict(speeds=[100], distances=[100000], settle_time=0, step_timeout=1,
                       return_after=False,
                       profile={"max_velocity": 50, "limits": {"enabled": False}})
         with self.assertRaisesRegex(ValueError, "最大速度"):
             app._run_linked_actuator_test_worker(config, app._linked_snapshot())
-        app._run_linked_move.assert_not_called()
+        app._command_profile_positions.assert_not_called()
         config["speeds"] = [5]
-        with self.assertRaisesRegex(ValueError, "默认限位"):
+        config["profile"]["limits"] = {"enabled": True, "min": -1000, "max": 1000}
+        with self.assertRaisesRegex(ValueError, "enabled limits"):
             app._run_linked_actuator_test_worker(config, app._linked_snapshot())
-        app._run_linked_move.assert_not_called()
+        app._command_profile_positions.assert_not_called()
+
+    def test_linked_targets_check_count_range_for_both_axes_without_mapping(self):
+        app = linked_app()
+        link = app._linked_snapshot()
+        app._validate_linked_targets({"Actuator A": -100000, "Actuator B": 100000}, link)
+        for axis in app.nodes:
+            targets = {"Actuator A": 0, "Actuator B": 0}
+            targets[axis] = 2**31
+            with self.subTest(axis=axis), self.assertRaisesRegex(ValueError, axis):
+                app._validate_linked_targets(targets, link)
 
     def test_profile_snapshot_does_not_change_active_position_window(self):
         app = make_app()
@@ -237,7 +259,6 @@ class HardeningTests(unittest.TestCase):
         app = make_app()
         app.position_panel.user_zero_set = True
         app.position_panel.user_zero_um = 0.0
-        app.travel_range.confirm(30000, 50, "Actuator A")
         app.node = NS(id=33)
         app.nodes = {"Actuator A": app.node}
         app._require_node = Mock(return_value=app.node)
@@ -279,7 +300,6 @@ class HardeningTests(unittest.TestCase):
         app.nodes = {"Actuator A": app.node}
         app.position_panel.user_zero_set = True
         app.position_panel.user_zero_um = 8000
-        app.travel_range.confirm(38000, 50, "Actuator A")
         app._read_actual_position_inc = Mock(return_value=19000)
         app._run_test_move = Mock(return_value={"status": "OK"})
         config = dict(start=50, switch=10050, end=13000, fast_speed=50, slow_speed=5,
@@ -779,9 +799,7 @@ class HardeningTests(unittest.TestCase):
 
     def test_standard_cycle_intersects_narrower_custom_limits(self):
         app = make_app()
-        app.position_panel.default_limit_active = lambda: True
         app.position_panel.user_zero_set = True
-        app.travel_range.confirm(30000, 50, "Actuator A")
         app.limit_enabled_var = var(True)
         app.min_limit_var = var("1000")
         app.max_limit_var = var("12000")
@@ -844,17 +862,8 @@ class HardeningTests(unittest.TestCase):
         app._run_linked_move({"Actuator A": 100, "Actuator B": 100}, profile, 1, link,
                              starts_inc={"Actuator A": 0, "Actuator B": 0})
         app._apply_linked_limits_worker.assert_called_once_with(limits, link)
-    def test_linked_target_must_fit_each_axis_mechanical_mapping(self):
-        app = linked_app()
-        app._read_actual_position_inc = Mock(side_effect=lambda node, **kwargs: 29500 if node.id == 32 else 0)
-        link = {"enabled": True, "invert_b": False,
-                "offsets": {"Actuator A": 29500, "Actuator B": 0}, "tolerance_um": 20}
-        with self.assertRaisesRegex(ValueError, "行程范围"):
-            app._run_linked_move({"Actuator A": 30500, "Actuator B": 1000},
-                                 {"position_window_inc": 2}, 1, link,
-                                 starts_inc={"Actuator A": 29500, "Actuator B": 0})
 
-    def test_communication_failure_suspends_linked_zero_and_mappings(self):
+    def test_communication_failure_suspends_linked_zero(self):
         app = linked_app()
         app.status_busy = True
         app._read_actual_position_inc = Mock(side_effect=RuntimeError("lost link"))
@@ -862,7 +871,6 @@ class HardeningTests(unittest.TestCase):
         app.reference_positions = {"Actuator A": 87, "Actuator B": 92}
         app._status_worker()
         self.assertEqual(app.reference_review, app.reference_positions)
-        self.assertEqual(len(app.travel_ranges), 2)
         self.assertEqual(len(app.linked_zero_offsets_inc), 2)
         with self.assertRaisesRegex(RuntimeError, "待复核"):
             app._reset_motion_cancel()
