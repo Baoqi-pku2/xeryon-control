@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from typing import Optional
 
 from canopen import BaseNode402
@@ -33,6 +34,7 @@ def poll_feedback(session, *, rest_seconds) -> None:
         with session.io_lock:
             _sample_and_supervise(session)
     except Exception as exc:
+        logging.getLogger(__name__).exception("Feedback read failed")
         capture = session.__dict__.get("motion_capture")
         if capture is not None:
             capture.finish()
@@ -49,6 +51,7 @@ def poll_feedback(session, *, rest_seconds) -> None:
             try:
                 session._disable_nodes(list(session.nodes.values()))
             except Exception as stop_exc:
+                logging.getLogger(__name__).exception("Stop after communication failure was not confirmed")
                 stop_errors.append(str(stop_exc))
             session.stop_unconfirmed = bool(stop_errors)
             session.active_target_inc = None

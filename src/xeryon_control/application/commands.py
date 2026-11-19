@@ -6,6 +6,7 @@ and the event sink. Device operations always run under the session I/O lock.
 from __future__ import annotations
 
 import threading
+import logging
 from typing import Callable
 
 from canopen import BaseNode402
@@ -63,6 +64,7 @@ class CommandDispatcher:
             else:
                 self._post("log", f"{label} complete.")
         except Exception as exc:
+            logging.getLogger(__name__).exception("Command failed: %s", label)
             error_handler(exc)
             self._post("log", f"{label} failed: {exc}")
             self._post("error", str(exc))

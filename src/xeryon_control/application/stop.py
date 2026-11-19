@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import logging
 from typing import Callable
 
 from canopen import BaseNode402
@@ -50,6 +51,7 @@ class StopCoordinator:
                 try:
                     self._write_controlword(node, 0x00)
                 except Exception as exc:
+                    logging.getLogger(__name__).exception("Immediate stop send failed")
                     self._post("log", f"Immediate stop send failed: {exc}")
             if not self.io_lock.acquire(timeout=2.0):
                 raise RuntimeError("通信线程未及时释放，停止状态未确认")
@@ -61,6 +63,7 @@ class StopCoordinator:
                 self.io_lock.release()
             self._post("log", f"{label} complete.")
         except Exception as exc:
+            logging.getLogger(__name__).exception("Stop verification failed: %s", label)
             self.stop_unconfirmed = True
             self._post("target", "停止未确认，请断开驱动电源")
             self._post("log", f"{label} failed: {exc}")

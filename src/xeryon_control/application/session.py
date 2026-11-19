@@ -17,6 +17,7 @@ from serial.tools import list_ports
 
 from xeryon_control.hardware.parameters import EncoderRes, HomingMethod, NodeOperationMode
 from xeryon_control.reporting.traces import append_event, new_trace_path, results_folder
+from xeryon_control.reporting.logging_service import current_logging, logs_folder
 from xeryon_control.application.stop import StopCoordinator
 from xeryon_control.application.commands import CommandDispatcher
 from xeryon_control.application.feedback import (
@@ -55,8 +56,7 @@ from xeryon_control.config import (
 )
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logging.getLogger("canopen").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
 POLL_INTERVAL_MS = 100
@@ -267,6 +267,12 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
     def open_report_folder(self) -> None:
         if self.last_report_dir:
             os.startfile(self.last_report_dir)
+
+    def open_log_folder(self) -> None:
+        service = current_logging()
+        folder = service.path.parent if service is not None else logs_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(folder)
 
     def start_repeatability(self) -> None:
         if self.command_busy:
@@ -2329,9 +2335,18 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
     # Main-thread UI updates
     # ------------------------------------------------------------------
     def _post(self, kind: str, payload: object) -> None:
+        if kind == "log":
+            logger.info("%s", payload)
+        elif kind == "error":
+            logger.error("%s", payload)
         self.ui_queue.put((kind, payload))
 
     def _drain_ui_queue(self) -> None:
+        service = current_logging()
+        if service is not None:
+            for notice in service.take_notices():
+                # Writer failures bypass file logging to avoid a failure loop.
+                self._log_many([notice])
         # Limit each callback so queued updates cannot starve STOP/Esc or paint.
         deadline = time.monotonic() + UI_EVENT_BUDGET_SECONDS
         pending_logs = []
@@ -2350,6 +2365,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
                             pending_logs.clear()
                         self._handle_ui_event(kind, payload)
                 except Exception as exc:
+                    logger.exception("UI event failed: %s", kind)
                     self._log(f"界面消息 {kind} 处理失败：{exc}")
                     self._show_error(f"界面更新异常：{exc}")
                 if time.monotonic() >= deadline:
@@ -2369,7 +2385,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             if self.view:
                 self.view.monitor.receive(kind, payload)
         elif kind == "log":
-            self._log(str(payload))
+            self._log_many([str(payload)])
         elif kind == "error":
             self._show_error(str(payload))
         elif kind == "busy":
@@ -2571,6 +2587,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             self.runtime_position_window_inc = max(1, self._um_to_inc(float(payload["position_window"])))
 
     def _log(self, message: str) -> None:
+        logger.info("%s", message)
         self._log_many([message])
 
     def _log_many(self, messages: list[str]) -> None:
@@ -2578,6 +2595,7 @@ class ControllerSession(CommandDispatcher, StopCoordinator, FeedbackMonitoring, 
             self.view.append_logs(messages)
 
     def _show_error(self, message):
+        logger.warning("Controller notice: %s", message)
         if self.close_in_progress or self.view is None:
             self._log(message)
         else:

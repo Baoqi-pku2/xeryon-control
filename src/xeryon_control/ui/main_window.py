@@ -2,6 +2,7 @@
 
 import sys
 import time
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
@@ -196,6 +197,7 @@ class MainWindow(QMainWindow):
         try:
             action()
         except (ValueError, RuntimeError, OSError) as exc:
+            logging.getLogger(__name__).exception("UI action failed")
             self.session._show_error(str(exc))
 
     def refresh(self):
@@ -380,7 +382,10 @@ def create_desktop(*, settings_file=None):
 
 
 def main():
+    from xeryon_control.reporting.logging_service import start_logging
+    service = start_logging()
     app, window = create_desktop(settings_file=preferences_path())
+    window.session._log(f"运行日志：{service.path}")
     window.show()
     if "--smoke-test" in sys.argv:
         app.processEvents()

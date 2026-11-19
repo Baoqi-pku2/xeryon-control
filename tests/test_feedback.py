@@ -153,11 +153,17 @@ class FeedbackTests(unittest.TestCase):
         self.assertTrue(any(call.args[0] == "shortcut_failed" for call in app._post.call_args_list))
 
     def test_trace_contains_command_position_and_stop(self):
+        from xeryon_control.reporting.logging_service import start_logging, shutdown_logging
         app, node, _ = make_app()
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as directory, patch.dict("os.environ", {"LOCALAPPDATA": directory}):
-            app._start_motion_trace(node, 0, 100, {"velocity":5})
-            app._status_worker()
-            events = [json.loads(line) for line in app.motion_trace_path.read_text(encoding="utf-8").splitlines()]
+            service = start_logging(install_hooks=False)
+            try:
+                app._start_motion_trace(node, 0, 100, {"velocity":5})
+                app._status_worker()
+                self.assertTrue(service.flush())
+                events = [json.loads(line) for line in app.motion_trace_path.read_text(encoding="utf-8").splitlines()]
+            finally:
+                shutdown_logging()
             self.assertEqual(events[0]["target_inc"], 100)
             self.assertEqual(events[-1]["reason"], "no_progress_live_confirmed")
             self.assertEqual(events[-1]["position_inc"], 20)

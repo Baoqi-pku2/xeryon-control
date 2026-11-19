@@ -406,7 +406,15 @@ class AdvancedPages(QTabWidget):
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
         self.log.setObjectName("deviceLog")
-        self.addTab(self.log, icon("pulse"), "运行日志")
+        log_page = QWidget()
+        log_layout = QVBoxLayout(log_page)
+        log_layout.setContentsMargins(16, 14, 16, 16)
+        self.open_logs = button("打开日志文件夹", lambda: guarded(s.open_log_folder))
+        self.clear_logs = button("清空显示", self.log.clear)
+        log_layout.addLayout(row(label("操作记录", "sectionTitle"), None,
+                                 self.open_logs, self.clear_logs))
+        log_layout.addWidget(self.log, 1)
+        self.addTab(log_page, icon("pulse"), "运行日志")
 
     def refresh(self):
         s = self.session
